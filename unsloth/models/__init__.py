@@ -12,6 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from ._flash_attention_compat import fix_transformers_flash_attention_packed_sequence_detection
+
+# Transformers can misclassify Qwen3.5's rank-3 position ids as packed-sequence
+# metadata and send invalid cu_seqlens to FlashAttention's varlen kernels. Patch
+# the packed-sequence probe before importing model implementations, while keeping
+# the normal FlashAttention fast path enabled.
+fix_transformers_flash_attention_packed_sequence_detection()
+del fix_transformers_flash_attention_packed_sequence_detection
+
 from .llama import FastLlamaModel
 from .loader import FastLanguageModel, FastVisionModel, FastTextModel, FastModel
 from .mistral import FastMistralModel
