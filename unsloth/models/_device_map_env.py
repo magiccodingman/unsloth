@@ -22,9 +22,17 @@ training activations need more room than the planner's generic heuristic keeps.
 These opt-in environment variables bridge that gap without changing default
 placement or overriding an explicit Python API request:
 
+``UNSLOTH_DEVICE_MAP_SAFETY_GIB``
+    Replace the planner's default 0.25 GiB head safety allowance. This is the
+    least invasive knob when the output-head GPU is only narrowly OOM: the
+    planner keeps its normal activation-reserve heuristic and simply leaves more
+    space on the head device.
+
 ``UNSLOTH_DEVICE_MAP_ACTIVATION_RESERVE_GIB``
     Either one GiB value for every device (``"2"``), or a comma-separated
-    per-logical-device mapping (``"0:1.5,1:2.5"``).
+    per-logical-device mapping (``"0:1.5,1:2.5"``). This is a hard measured
+    reserve and should be used only when the generic activation heuristic is
+    known to be wrong.
 
 ``UNSLOTH_DEVICE_MAP_FREE_SPACE_POLICY``
     ``"balanced"`` or ``"head_max"``.
@@ -44,6 +52,7 @@ import os
 from typing import Any
 
 _GIB = 1024 ** 3
+_SAFETY_ENV = "UNSLOTH_DEVICE_MAP_SAFETY_GIB"
 _RESERVE_ENV = "UNSLOTH_DEVICE_MAP_ACTIVATION_RESERVE_GIB"
 _POLICY_ENV = "UNSLOTH_DEVICE_MAP_FREE_SPACE_POLICY"
 _HEAD_ENV = "UNSLOTH_DEVICE_MAP_PREFER_HEAD_DEVICE"
@@ -91,6 +100,10 @@ def _parse_activation_reserve(raw: str) -> int | dict[int, int]:
 def _environment_overrides() -> dict[str, Any]:
     overrides: dict[str, Any] = {}
 
+    safety = os.environ.get(_SAFETY_ENV)
+    if safety is not None:
+        overrides["safety_bytes"] = _gib_to_bytes(safety)
+
     reserve = os.environ.get(_RESERVE_ENV)
     if reserve is not None:
         overrides["activation_reserve_bytes"] = _parse_activation_reserve(reserve)
@@ -113,6 +126,19 @@ def _environment_overrides() -> dict[str, Any]:
         overrides["prefer_head_device"] = head_device
 
     return overrides
+
+
+def _printable_overrides(applied: dict[str, Any]) -> dict[str, Any]:
+    printable = dict(applied)
+    for key in ("safety_bytes", "activation_reserve_bytes"):
+        value = printable.get(key)
+        if isinstance(value, int):
+            printable[key] = f"{value / _GIB:.3f} GiB"
+        elif isinstance(value, dict):
+            printable[key] = {
+                device: f"{amount / _GIB:.3f} GiB" for device, amount in value.items()
+            }
+    return printable
 
 
 def install_device_map_environment_overrides() -> None:
@@ -142,16 +168,10 @@ def install_device_map_environment_overrides() -> None:
                         applied[key] = value
                 planner_kwargs = merged
                 if applied:
-                    printable = dict(applied)
-                    reserve = printable.get("activation_reserve_bytes")
-                    if isinstance(reserve, int):
-                        printable["activation_reserve_bytes"] = f"{reserve / _GIB:.3f} GiB"
-                    elif isinstance(reserve, dict):
-                        printable["activation_reserve_bytes"] = {
-                            device: f"{amount / _GIB:.3f} GiB"
-                            for device, amount in reserve.items()
-                        }
-                    print(f"Unsloth: device-map environment overrides: {printable}")
+                    print(
+                        "Unsloth: device-map environment overrides: "
+                        f"{_printable_overrides(applied)}"
+                    )
 
         return original(
             device_map,
