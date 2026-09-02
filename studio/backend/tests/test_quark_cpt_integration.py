@@ -87,6 +87,7 @@ def test_quark_fused_ce_workspace_preserves_stricter_user_cap(monkeypatch):
 def test_quark_device_map_keeps_dense_endpoints_apart_and_favors_clean_gpu():
     device_map = _build_experimental_quark_device_map()
 
+    assert EXPERIMENTAL_QUARK_FUSED_CE_TARGET_GB == 0.25
     assert EXPERIMENTAL_QUARK_ACTIVATION_CHUNK_SIZE == 2048
     assert EXPERIMENTAL_QUARK_FIRST_CUDA_LAYER_COUNT == 28
     assert device_map["model.language_model.embed_tokens"] == 0

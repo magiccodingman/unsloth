@@ -104,7 +104,7 @@ STREAMING_EVAL_MAX_SAMPLES = 500
 # logits workspace, while Quark's W4A4 emulation needs a sequence-linear
 # activation temporary. These bounds change chunking only, not trainable
 # parameters or the loss definition.
-EXPERIMENTAL_QUARK_FUSED_CE_TARGET_GB = 0.5
+EXPERIMENTAL_QUARK_FUSED_CE_TARGET_GB = 0.25
 EXPERIMENTAL_QUARK_ACTIVATION_CHUNK_SIZE = 2048
 EXPERIMENTAL_QUARK_FIRST_CUDA_LAYER_COUNT = 28
 
