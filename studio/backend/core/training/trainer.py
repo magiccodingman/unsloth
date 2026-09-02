@@ -99,6 +99,28 @@ logger = get_logger(__name__)
 STREAMING_EVAL_MAX_SAMPLES = 500
 
 
+def _is_supported_local_quark_qwen35_checkpoint(model_path: str) -> bool:
+    """Recognize only the packed Quark format validated by the CPT experiment."""
+    try:
+        config_path = Path(model_path) / "config.json"
+        if not config_path.is_file():
+            return False
+        with config_path.open("r", encoding="utf-8") as config_file:
+            raw_config = json.load(config_file)
+        from unsloth.models.quark import is_quark_qwen35_mxfp4_config
+
+        text_config = raw_config.get("text_config") or {}
+        return is_quark_qwen35_mxfp4_config(raw_config) and all(
+            (
+                text_config.get("num_hidden_layers") == 64,
+                text_config.get("hidden_size") == 5120,
+                text_config.get("vocab_size") == 248320,
+            )
+        )
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+
+
 def _build_report_targets(training_args) -> list[str] | str:
     report_to: list[str] = []
     if training_args.get("enable_wandb", False):
@@ -296,6 +318,7 @@ class UnslothTrainer:
         self.should_stop = False
         self.save_on_stop = True
         self.load_in_4bit = True
+        self._experimental_quark_qlora = False
 
         self.is_cpt = False  # Continued Pretraining
         self.is_vlm = False
@@ -726,6 +749,7 @@ class UnslothTrainer:
         if self.should_stop and self.save_on_stop:
             self.trainer._save_checkpoint(self.trainer.model, trial = None)
             self.trainer.save_model()
+            self._verify_quark_adapter_save(output_dir)
             self.tokenizer.save_pretrained(output_dir)
             self._patch_adapter_config(output_dir)
             msg = f"{label} training stopped" if label else "Training stopped"
@@ -740,6 +764,7 @@ class UnslothTrainer:
             self._update_progress(is_training = False, status_message = "Training cancelled.")
         else:
             self.trainer.save_model()
+            self._verify_quark_adapter_save(output_dir)
             self.tokenizer.save_pretrained(output_dir)
             self._patch_adapter_config(output_dir)
             msg = f"{label} training completed" if label else "Training completed"
@@ -749,6 +774,48 @@ class UnslothTrainer:
                 is_completed = True,
                 status_message = f"Training completed! Model saved to {output_dir}",
             )
+
+    def _verify_quark_adapter_save(self, output_dir) -> None:
+        """Fail loudly if a packed-Quark run's final adapter omits trained tensors."""
+        if not self._experimental_quark_qlora:
+            return
+        from safetensors import safe_open
+
+        adapter_files = sorted(Path(output_dir).glob("adapter_model*.safetensors"))
+        if not adapter_files:
+            raise RuntimeError(
+                "Packed Quark CPT save validation found no adapter_model safetensors file."
+            )
+        keys = set()
+        for adapter_file in adapter_files:
+            with safe_open(adapter_file, framework="pt", device="cpu") as tensors:
+                keys.update(tensors.keys())
+
+        expected_wrappers = int(
+            getattr(self.model, "_unsloth_quark_lora_wrapper_count", 0)
+        )
+        lora_a = sum(".lora_A." in key for key in keys)
+        lora_b = sum(".lora_B." in key for key in keys)
+        has_embed = any("embed_tokens" in key for key in keys)
+        has_head = any("lm_head" in key for key in keys)
+        if (
+            expected_wrappers <= 0
+            or lora_a != expected_wrappers
+            or lora_b != expected_wrappers
+            or not has_embed
+            or not has_head
+        ):
+            raise RuntimeError(
+                "Packed Quark CPT adapter save is incomplete: "
+                f"files={len(adapter_files)}, keys={len(keys)}, lora_A={lora_a}, "
+                f"lora_B={lora_b}, expected_each={expected_wrappers}, "
+                f"embed_tokens={has_embed}, lm_head={has_head}."
+            )
+        logger.info(
+            "Validated packed Quark adapter save: %d keys, %d LoRA pairs, dense endpoints present.",
+            len(keys),
+            expected_wrappers,
+        )
 
     def _cleanup_audio_artifacts(self):
         """Remove sys.path/sys.modules entries from previous audio preprocessing.
@@ -994,6 +1061,75 @@ class UnslothTrainer:
                 bool(getattr(torch.version, "hip", None)) or "rocm" in torch.__version__.lower()
             )
             _auto_dtype = torch.float16 if (_is_rocm and not is_bfloat16_supported()) else None
+            self._experimental_quark_qlora = _is_supported_local_quark_qwen35_checkpoint(
+                lookup_name
+            )
+            if self._experimental_quark_qlora:
+                if full_finetuning:
+                    raise ValueError(
+                        "The experimental packed Quark path supports a frozen base plus LoRA, "
+                        "not full finetuning."
+                    )
+                if self.is_vlm:
+                    raise ValueError(
+                        "The experimental packed Quark path is validated for text CPT only; "
+                        "vision-tower training is not supported."
+                    )
+                if _is_rocm or not is_bfloat16_supported():
+                    raise ValueError(
+                        "The experimental packed Quark CPT path currently requires CUDA with BF16 support."
+                    )
+                load_in_4bit = False
+                self.load_in_4bit = False
+                _auto_dtype = torch.bfloat16
+                logger.warning(
+                    "Enabling narrow experimental Qwen3.5 Quark W4A4 MXFP4 QLoRA support: "
+                    "packed-state validation, BF16 endpoints, and Quark-safe PEFT dispatch are mandatory."
+                )
+                if get_visible_gpu_count() != 2:
+                    raise ValueError(
+                        "The validated packed Quark CPT topology currently requires exactly two visible GPUs."
+                    )
+                allocator_config = (
+                    os.environ.get("PYTORCH_ALLOC_CONF")
+                    or os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
+                    or ""
+                )
+                allocator_items = [
+                    item.strip()
+                    for item in allocator_config.split(",")
+                    if item.strip() and not item.strip().startswith("expandable_segments:")
+                ]
+                allocator_items.append("expandable_segments:True")
+                allocator_config = ",".join(allocator_items)
+                allocator_setter = getattr(
+                    torch._C,
+                    "_accelerator_setAllocatorSettings",
+                    None,
+                )
+                if allocator_setter is None:
+                    raise RuntimeError(
+                        "The packed Quark CPT path requires a Torch build that can enable "
+                        "expandable CUDA allocator segments before the model is loaded."
+                    )
+                allocator_setter(allocator_config)
+                os.environ["PYTORCH_ALLOC_CONF"] = allocator_config
+                device_map = {
+                    "model.visual": 0,
+                    "model.language_model.embed_tokens": 0,
+                    "model.language_model.rotary_emb": 0,
+                    "model.language_model.norm": 1,
+                    "lm_head": 1,
+                }
+                for layer_index in range(64):
+                    device_map[f"model.language_model.layers.{layer_index}"] = (
+                        0 if layer_index < 30 else 1
+                    )
+                logger.info(
+                    "Using the empirically validated contiguous Quark placement: "
+                    "layers 0-29 plus embeddings on cuda:0; layers 30-63 plus lm_head on cuda:1; "
+                    "expandable CUDA allocator segments enabled."
+                )
 
             if self._audio_type == "csm":
                 # CSM: FastModel, auto_model=CsmForConditionalGeneration, load_in_4bit=False
@@ -1164,7 +1300,21 @@ class UnslothTrainer:
                     token = hf_token,
                     trust_remote_code = trust_remote_code,
                     revision = model_revision,
-                    use_exact_model_name = model_revision is not None,
+                    use_exact_model_name = (
+                        model_revision is not None or self._experimental_quark_qlora
+                    ),
+                    experimental_quark_qlora = self._experimental_quark_qlora,
+                    experimental_quark_offload_frozen_vision=(
+                        self._experimental_quark_qlora
+                    ),
+                    **(
+                        {
+                            "attn_implementation": "flash_attention_2",
+                            "offload_embedding": False,
+                        }
+                        if self._experimental_quark_qlora
+                        else {}
+                    ),
                 )
                 logger.info("Loaded text model")
 
@@ -1456,6 +1606,38 @@ class UnslothTrainer:
                     modules_to_save = modules_to_save,
                 )
             else:
+                if self._experimental_quark_qlora and isinstance(target_modules, list):
+                    required_dense_endpoints = {"embed_tokens", "lm_head"}
+                    if not required_dense_endpoints.issubset(modules_to_save or []):
+                        raise ValueError(
+                            "The validated packed Quark CPT topology requires dense BF16 "
+                            "embed_tokens and lm_head in modules_to_save."
+                        )
+                    standard_targets = {
+                        "q_proj",
+                        "k_proj",
+                        "v_proj",
+                        "o_proj",
+                        "gate_proj",
+                        "up_proj",
+                        "down_proj",
+                    }
+                    if standard_targets.issubset(target_modules):
+                        hybrid_targets = (
+                            "in_proj_qkv",
+                            "in_proj_z",
+                            "in_proj_a",
+                            "in_proj_b",
+                            "out_proj",
+                        )
+                        target_modules = [
+                            *target_modules,
+                            *(name for name in hybrid_targets if name not in target_modules),
+                        ]
+                        logger.info(
+                            "Expanded the standard Qwen target set to all 12 language projection "
+                            f"types for packed Quark CPT: {target_modules}\n"
+                        )
                 logger.info(f"Text model LoRA configuration:")
                 logger.info(f"  - Target modules: {target_modules}\n")
                 if modules_to_save:
@@ -1474,6 +1656,15 @@ class UnslothTrainer:
                     use_dora = use_dora,
                     loftq_config = {"loftq_bits": 4, "loftq_iter": 1} if use_loftq else None,
                     modules_to_save = modules_to_save,
+                    experimental_quark_activation_chunk_size=(
+                        2048 if self._experimental_quark_qlora else None
+                    ),
+                    experimental_quark_release_cache_after_forward=(
+                        self._experimental_quark_qlora
+                    ),
+                    experimental_quark_offload_redundant_dense_originals=(
+                        self._experimental_quark_qlora
+                    ),
                 )
 
             if self.should_stop:

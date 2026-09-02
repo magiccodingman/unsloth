@@ -44,6 +44,14 @@ from ._utils import (
 )
 from ._utils import *
 from ._custom_dtype import resolve_dtype, trusted_custom_dtype
+from .quark import (
+    ensure_quark_transformers_compatibility,
+    finalize_quark_qlora_peft_model,
+    offload_quark_frozen_vision_tower,
+    protect_quark_config_from_dtype_rewrite,
+    quark_qwen35_load_context,
+    validate_loaded_quark_qwen35_mxfp4,
+)
 from .loader_utils import (
     DEFAULT_DEVICE_MAP,
     OFFLOAD_EMBEDDING_AUTO,
@@ -1112,6 +1120,8 @@ class FastBaseModel:
         unsloth_vllm_standby = False,
         load_in_fp8 = False,  # fp8 LoRA (True, False, 'block')
         text_only = False,
+        experimental_quark_qlora = False,
+        experimental_quark_offload_frozen_vision = False,
         # True when the caller already swapped a multimodal config for its text sub-config,
         # so `auto_config` no longer describes the repo. Set by loader.py, and by the block
         # below on the direct-call path.
@@ -1370,6 +1380,11 @@ class FastBaseModel:
 
         bnb_config = None
         user_quantization_config = kwargs.get("quantization_config", None)
+        if experimental_quark_qlora:
+            # Transformers constructs QuarkConfig before the guarded weight-load
+            # context below. Quark 0.12 renamed Config to QConfig, so install the
+            # narrow alias before AutoHfQuantizer.from_dict is reached.
+            ensure_quark_transformers_compatibility()
 
         # Check if model already has a non-bitsandbytes quantization config (e.g. compressed-tensors/NVFP4)
         from .loader_utils import (
@@ -1536,7 +1551,12 @@ class FastBaseModel:
             )
         elif load_in_16bit:
             bnb_config = None
-        elif not load_in_4bit and not load_in_8bit and not full_finetuning:
+        elif (
+            not load_in_4bit
+            and not load_in_8bit
+            and not full_finetuning
+            and not experimental_quark_qlora
+        ):
             print("Unsloth: QLoRA and full finetuning all not selected. Switching to 16bit LoRA.")
 
         if full_finetuning:
@@ -1664,17 +1684,33 @@ class FastBaseModel:
                 _cfg_val = kwargs.pop("max_position_embeddings", None)
                 if _cfg_val is not None:
                     setattr(model_config, "max_position_embeddings", _cfg_val)
-                model = auto_model.from_pretrained(
-                    model_name,
-                    config = model_config,
-                    device_map = device_map,
-                    # torch_dtype           = torch_dtype, # Transformers removed torch_dtype
-                    # quantization_config   = bnb_config,
-                    token = token,
-                    trust_remote_code = trust_remote_code,
-                    # attn_implementation   = attn_implementation,
-                    **kwargs,
-                )
+                with quark_qwen35_load_context(
+                    model_config,
+                    enabled = experimental_quark_qlora,
+                ) as _quark_qlora_load:
+                    model = auto_model.from_pretrained(
+                        model_name,
+                        config = model_config,
+                        device_map = device_map,
+                        # torch_dtype           = torch_dtype, # Transformers removed torch_dtype
+                        # quantization_config   = bnb_config,
+                        token = token,
+                        trust_remote_code = trust_remote_code,
+                        # attn_implementation   = attn_implementation,
+                        **kwargs,
+                    )
+                if _quark_qlora_load:
+                    _packed_count = validate_loaded_quark_qwen35_mxfp4(model)
+                    print(
+                        f"Unsloth: validated {_packed_count} packed Quark W4A4 MXFP4 "
+                        "decoder modules for experimental QLoRA."
+                    )
+                    if experimental_quark_offload_frozen_vision:
+                        _vision_bytes = offload_quark_frozen_vision_tower(model)
+                        print(
+                            "Unsloth: moved the excluded Quark vision tower to CPU "
+                            f"({_vision_bytes / 2**30:.6f} GiB freed from CUDA)."
+                        )
                 # Must precede _attach_bnb_multidevice_hooks: it returns early
                 # while offload_embedding is True.
                 offload_embedding = _resolve_offload_embedding(
@@ -1994,14 +2030,15 @@ class FastBaseModel:
                 tokenizer.pad_token = __tokenizer.pad_token
                 tokenizer.pad_token_id = __tokenizer.pad_token_id
         # Fix other stuff like BnB compute data types
-        model, tokenizer = patch_model_and_tokenizer(
-            model,
-            tokenizer,
-            downcast_rope = False,
-            fix_embeddings = False,
-            do_forced_float32 = do_forced_float32,
-            correct_dtype = correct_dtype,
-        )
+        with protect_quark_config_from_dtype_rewrite(model):
+            model, tokenizer = patch_model_and_tokenizer(
+                model,
+                tokenizer,
+                downcast_rope = False,
+                fix_embeddings = False,
+                do_forced_float32 = do_forced_float32,
+                correct_dtype = correct_dtype,
+            )
 
         try:
             model, tokenizer = patch_tokenizer(model, tokenizer)
@@ -2196,6 +2233,9 @@ class FastBaseModel:
         target_parameters = None,  # For MoE expert layers (nn.Parameter)
         ensure_weight_tying = None,  # None = auto (tie when we redirect a tied pair)
         finetune_audio_layers = False,  # placed last to preserve existing positional argument order
+        experimental_quark_activation_chunk_size = None,
+        experimental_quark_release_cache_after_forward = False,
+        experimental_quark_offload_redundant_dense_originals = False,
         **kwargs,
     ):
         if os.environ.get("UNSLOTH_ENABLE_FULL_FINETUNING", "0") == "1":
@@ -2503,6 +2543,14 @@ class FastBaseModel:
             gc.collect()
             clean_gpu_cache()
         patch_saving_functions(model, vision = True)
+        model = finalize_quark_qlora_peft_model(
+            model,
+            activation_chunk_size = experimental_quark_activation_chunk_size,
+            release_cache_after_forward = experimental_quark_release_cache_after_forward,
+            offload_redundant_dense_originals=(
+                experimental_quark_offload_redundant_dense_originals
+            ),
+        )
         patch_peft_fast_inference(model)
 
         # Add for_inference and for_training
