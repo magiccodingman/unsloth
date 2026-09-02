@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -10,7 +11,12 @@ import torch
 from safetensors.torch import save_file
 
 from core.training.trainer import (
+    EXPERIMENTAL_QUARK_ACTIVATION_CHUNK_SIZE,
+    EXPERIMENTAL_QUARK_FIRST_CUDA_LAYER_COUNT,
+    EXPERIMENTAL_QUARK_FUSED_CE_TARGET_GB,
     UnslothTrainer,
+    _build_experimental_quark_device_map,
+    _configure_experimental_quark_fused_ce_workspace,
     _is_supported_local_quark_qwen35_checkpoint,
 )
 
@@ -55,6 +61,48 @@ def test_local_quark_detection_is_exact(tmp_path):
     ] = 64
     (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
     assert not _is_supported_local_quark_qwen35_checkpoint(str(tmp_path))
+
+
+def test_quark_fused_ce_workspace_is_capped_after_zoo_import(monkeypatch):
+    fused_ce = SimpleNamespace(TARGET_GB="4")
+    monkeypatch.setenv("UNSLOTH_CE_LOSS_TARGET_GB", "3")
+    monkeypatch.setattr("importlib.import_module", lambda name: fused_ce)
+
+    effective = _configure_experimental_quark_fused_ce_workspace()
+
+    assert effective == EXPERIMENTAL_QUARK_FUSED_CE_TARGET_GB
+    assert os.environ["UNSLOTH_CE_LOSS_TARGET_GB"] == str(effective)
+    assert fused_ce.TARGET_GB == str(effective)
+
+
+def test_quark_fused_ce_workspace_preserves_stricter_user_cap(monkeypatch):
+    fused_ce = SimpleNamespace(TARGET_GB="4")
+    monkeypatch.setenv("UNSLOTH_CE_LOSS_TARGET_GB", "0.25")
+    monkeypatch.setattr("importlib.import_module", lambda name: fused_ce)
+
+    assert _configure_experimental_quark_fused_ce_workspace() == 0.25
+    assert fused_ce.TARGET_GB == "0.25"
+
+
+def test_quark_device_map_keeps_dense_endpoints_apart_and_favors_clean_gpu():
+    device_map = _build_experimental_quark_device_map()
+
+    assert EXPERIMENTAL_QUARK_ACTIVATION_CHUNK_SIZE == 2048
+    assert EXPERIMENTAL_QUARK_FIRST_CUDA_LAYER_COUNT == 28
+    assert device_map["model.language_model.embed_tokens"] == 0
+    assert device_map["lm_head"] == 1
+    assert device_map["model.language_model.layers.27"] == 0
+    assert device_map["model.language_model.layers.28"] == 1
+    assert sum(
+        device == 0
+        for name, device in device_map.items()
+        if "language_model.layers." in name
+    ) == 28
+    assert sum(
+        device == 1
+        for name, device in device_map.items()
+        if "language_model.layers." in name
+    ) == 36
 
 
 def test_quark_adapter_save_requires_every_lora_pair_and_dense_endpoints(tmp_path):

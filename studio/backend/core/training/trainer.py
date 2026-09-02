@@ -98,6 +98,59 @@ logger = get_logger(__name__)
 # source on every eval step. Cap it so each evaluation terminates.
 STREAMING_EVAL_MAX_SAMPLES = 500
 
+# Empirical limits for the exact packed-Qwen topology accepted below. Dense
+# vocabulary training creates one 2.37 GiB gradient on each endpoint GPU. The
+# fused CE default can create another full-size lm_head gradient plus a large
+# logits workspace, while Quark's W4A4 emulation needs a sequence-linear
+# activation temporary. These bounds change chunking only, not trainable
+# parameters or the loss definition.
+EXPERIMENTAL_QUARK_FUSED_CE_TARGET_GB = 0.5
+EXPERIMENTAL_QUARK_ACTIVATION_CHUNK_SIZE = 2048
+EXPERIMENTAL_QUARK_FIRST_CUDA_LAYER_COUNT = 28
+
+
+def _configure_experimental_quark_fused_ce_workspace() -> float:
+    """Cap fused-CE workspace in this per-job process for dense-head Quark CPT."""
+    configured = os.environ.get("UNSLOTH_CE_LOSS_TARGET_GB")
+    try:
+        configured_value = float(configured) if configured is not None else None
+    except (TypeError, ValueError):
+        configured_value = None
+    if configured_value is None or configured_value <= 0:
+        effective = EXPERIMENTAL_QUARK_FUSED_CE_TARGET_GB
+    else:
+        effective = min(configured_value, EXPERIMENTAL_QUARK_FUSED_CE_TARGET_GB)
+    value = str(effective)
+    os.environ["UNSLOTH_CE_LOSS_TARGET_GB"] = value
+
+    # unsloth_zoo reads the environment variable at module import time. Studio
+    # has normally imported it already, so update that cached module setting too.
+    try:
+        import importlib
+
+        fused_ce = importlib.import_module("unsloth_zoo.fused_losses.cross_entropy_loss")
+    except ImportError:
+        pass
+    else:
+        fused_ce.TARGET_GB = value
+    return effective
+
+
+def _build_experimental_quark_device_map() -> dict[str, int]:
+    """Place dense vocabulary endpoints on separate GPUs with desktop headroom."""
+    device_map = {
+        "model.visual": 0,
+        "model.language_model.embed_tokens": 0,
+        "model.language_model.rotary_emb": 0,
+        "model.language_model.norm": 1,
+        "lm_head": 1,
+    }
+    for layer_index in range(64):
+        device_map[f"model.language_model.layers.{layer_index}"] = (
+            0 if layer_index < EXPERIMENTAL_QUARK_FIRST_CUDA_LAYER_COUNT else 1
+        )
+    return device_map
+
 
 def _is_supported_local_quark_qwen35_checkpoint(model_path: str) -> bool:
     """Recognize only the packed Quark format validated by the CPT experiment."""
@@ -1114,20 +1167,12 @@ class UnslothTrainer:
                     )
                 allocator_setter(allocator_config)
                 os.environ["PYTORCH_ALLOC_CONF"] = allocator_config
-                device_map = {
-                    "model.visual": 0,
-                    "model.language_model.embed_tokens": 0,
-                    "model.language_model.rotary_emb": 0,
-                    "model.language_model.norm": 1,
-                    "lm_head": 1,
-                }
-                for layer_index in range(64):
-                    device_map[f"model.language_model.layers.{layer_index}"] = (
-                        0 if layer_index < 30 else 1
-                    )
+                fused_ce_target_gb = _configure_experimental_quark_fused_ce_workspace()
+                device_map = _build_experimental_quark_device_map()
                 logger.info(
-                    "Using the empirically validated contiguous Quark placement: "
-                    "layers 0-29 plus embeddings on cuda:0; layers 30-63 plus lm_head on cuda:1; "
+                    "Using the measured dense-endpoint Quark placement: "
+                    "layers 0-27 plus embeddings on cuda:0; layers 28-63 plus lm_head on cuda:1; "
+                    f"fused-CE target={fused_ce_target_gb:.3g} GiB; "
                     "expandable CUDA allocator segments enabled."
                 )
 
@@ -1657,7 +1702,9 @@ class UnslothTrainer:
                     loftq_config = {"loftq_bits": 4, "loftq_iter": 1} if use_loftq else None,
                     modules_to_save = modules_to_save,
                     experimental_quark_activation_chunk_size=(
-                        2048 if self._experimental_quark_qlora else None
+                        EXPERIMENTAL_QUARK_ACTIVATION_CHUNK_SIZE
+                        if self._experimental_quark_qlora
+                        else None
                     ),
                     experimental_quark_release_cache_after_forward=(
                         self._experimental_quark_qlora
