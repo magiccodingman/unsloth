@@ -144,6 +144,136 @@ def _resolve_experimental_quark_optimizer(optimizer: Any, enabled: bool) -> Any:
     return optimizer
 
 
+def _install_experimental_quark_loss_only_evaluation(trainer: Any) -> bool:
+    """Keep periodic Quark evaluation on the chunked loss path, without logits.
+
+    Unsloth globally replaces Transformers' prediction_step and forces
+    UNSLOTH_RETURN_LOGITS=1 before it checks prediction_loss_only. A single
+    near-8K row for this 248,320-token vocabulary then materializes a 7.33 GiB
+    FP32 logits tensor. Studio only consumes eval_loss here, so compute exactly
+    that and return no predictions.
+    """
+    if trainer is None or getattr(trainer, "eval_dataset", None) is None:
+        return False
+
+    trainer.args.prediction_loss_only = True
+
+    def _loss_only_prediction_step(
+        trainer_self,
+        model,
+        inputs,
+        prediction_loss_only,
+        ignore_keys = None,
+    ):
+        del prediction_loss_only, ignore_keys
+        inputs = trainer_self._prepare_inputs(inputs)
+        previous_return_logits = os.environ.get("UNSLOTH_RETURN_LOGITS")
+        os.environ["UNSLOTH_RETURN_LOGITS"] = "0"
+        try:
+            with torch.no_grad():
+                with trainer_self.compute_loss_context_manager():
+                    try:
+                        num_items_in_batch = trainer_self._get_num_items_in_batch(
+                            [inputs], trainer_self.args.device
+                        )
+                    except (AttributeError, TypeError):
+                        num_items_in_batch = None
+                    loss = trainer_self.compute_loss(
+                        model,
+                        inputs,
+                        return_outputs = False,
+                        num_items_in_batch = num_items_in_batch,
+                    )
+            return loss.detach().mean(), None, None
+        finally:
+            if previous_return_logits is None:
+                os.environ.pop("UNSLOTH_RETURN_LOGITS", None)
+            else:
+                os.environ["UNSLOTH_RETURN_LOGITS"] = previous_return_logits
+
+    trainer.prediction_step = types.MethodType(_loss_only_prediction_step, trainer)
+    return True
+
+
+def _restore_paged_optimizer_state_buffers(optimizer: Any) -> tuple[int, int]:
+    """Recreate serialized bitsandbytes state1/state2 as managed CUDA pages."""
+    restored_count = 0
+    restored_bytes = 0
+    for parameter, state in optimizer.state.items():
+        if getattr(getattr(parameter, "device", None), "type", None) != "cuda":
+            continue
+        if not isinstance(state, dict):
+            continue
+        for key in ("state1", "state2"):
+            value = state.get(key)
+            if not isinstance(value, torch.Tensor) or value.numel() < 100_000:
+                continue
+            # torch.save preserves bitsandbytes' Python attributes such as
+            # is_paged=True, but torch.load reconstructs ordinary CPU storage.
+            # Never trust the serialized flag here; get_state_buffer is what
+            # creates a fresh CUDA managed-memory allocation.
+            paged_value = optimizer.get_state_buffer(parameter, dtype = value.dtype)
+            paged_value.copy_(value, non_blocking = False)
+            state[key] = paged_value
+            restored_count += 1
+            restored_bytes += value.numel() * value.element_size()
+    return restored_count, restored_bytes
+
+
+def _install_experimental_quark_paged_optimizer_resume(trainer: Any) -> bool:
+    """Preserve bitsandbytes paging when Transformers restores optimizer.pt."""
+    if trainer is None or not hasattr(trainer, "_load_optimizer_and_scheduler"):
+        return False
+    original_restore = trainer._load_optimizer_and_scheduler
+
+    def _paged_restore(trainer_self, checkpoint):
+        optimizer = getattr(trainer_self, "optimizer", None)
+        base_optimizer = optimizer
+        visited = set()
+        while (
+            base_optimizer is not None
+            and id(base_optimizer) not in visited
+            and not getattr(base_optimizer, "is_paged", False)
+        ):
+            visited.add(id(base_optimizer))
+            base_optimizer = getattr(base_optimizer, "optimizer", None)
+        if checkpoint is None or not getattr(base_optimizer, "is_paged", False):
+            return original_restore(checkpoint)
+
+        original_load_state_dict = base_optimizer.load_state_dict
+
+        def _load_state_dict_without_cuda_materialization(state_dict, *args, **kwargs):
+            del args, kwargs
+            result = original_load_state_dict(state_dict, move_to_device = False)
+            count, restored_bytes = _restore_paged_optimizer_state_buffers(base_optimizer)
+            if count == 0:
+                state_summary = []
+                for parameter, state in list(base_optimizer.state.items())[:8]:
+                    device = getattr(parameter, "device", None)
+                    keys = sorted(state) if isinstance(state, dict) else [type(state).__name__]
+                    state_summary.append(f"{device}:{keys}")
+                raise RuntimeError(
+                    "Experimental Quark CPT could not restore any paged optimizer "
+                    "state buffers; refusing a potentially non-paged resume. "
+                    f"Loaded states={len(base_optimizer.state)}; samples={state_summary}"
+                )
+            logger.info(
+                "Experimental Quark CPT: restored "
+                f"{count} optimizer state buffers ({restored_bytes / 2**30:.6f} GiB) "
+                "as managed CUDA pages.\n"
+            )
+            return result
+
+        base_optimizer.load_state_dict = _load_state_dict_without_cuda_materialization
+        try:
+            return original_restore(checkpoint)
+        finally:
+            base_optimizer.load_state_dict = original_load_state_dict
+
+    trainer._load_optimizer_and_scheduler = types.MethodType(_paged_restore, trainer)
+    return True
+
+
 def _build_experimental_quark_device_map() -> dict[str, int]:
     """Place dense vocabulary endpoints on separate GPUs with desktop headroom."""
     device_map = {
@@ -4509,6 +4639,16 @@ class UnslothTrainer:
                 # Restore the full processor so checkpoints include preprocessor_config.json (GGUF export).
                 if sft_tokenizer is not self.tokenizer:
                     self.trainer.processing_class = self.tokenizer
+            if (
+                self._experimental_quark_qlora
+                and _install_experimental_quark_loss_only_evaluation(self.trainer)
+            ):
+                logger.warning(
+                    "Experimental Quark CPT: periodic evaluation is loss-only so "
+                    "near-8K rows do not materialize full FP32 vocabulary logits.\n"
+                )
+            if self._experimental_quark_qlora:
+                _install_experimental_quark_paged_optimizer_resume(self.trainer)
             logger.info("Trainer initialized\n")
 
             # ========== TRAIN ON RESPONSES ONLY ==========

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -18,7 +19,10 @@ from core.training.trainer import (
     UnslothTrainer,
     _build_experimental_quark_device_map,
     _configure_experimental_quark_fused_ce_workspace,
+    _install_experimental_quark_loss_only_evaluation,
+    _install_experimental_quark_paged_optimizer_resume,
     _is_supported_local_quark_qwen35_checkpoint,
+    _restore_paged_optimizer_state_buffers,
     _resolve_experimental_quark_optimizer,
 )
 
@@ -126,6 +130,165 @@ def test_quark_dense_vocab_cpt_pages_adamw8bit_state():
         _resolve_experimental_quark_optimizer("adamw_torch", enabled=True)
         == "adamw_torch"
     )
+
+
+def test_quark_periodic_evaluation_never_requests_full_logits(monkeypatch):
+    calls = []
+
+    class FakeTrainer:
+        eval_dataset = [object()]
+        args = SimpleNamespace(prediction_loss_only=False, device=torch.device("cpu"))
+
+        @staticmethod
+        def _prepare_inputs(inputs):
+            return inputs
+
+        @staticmethod
+        def compute_loss_context_manager():
+            return nullcontext()
+
+        @staticmethod
+        def _get_num_items_in_batch(inputs, device):
+            assert device.type == "cpu"
+            return inputs[0]["labels"].numel()
+
+        @staticmethod
+        def compute_loss(
+            model,
+            inputs,
+            *,
+            return_outputs,
+            num_items_in_batch,
+        ):
+            calls.append(
+                {
+                    "return_logits": os.environ.get("UNSLOTH_RETURN_LOGITS"),
+                    "return_outputs": return_outputs,
+                    "num_items": num_items_in_batch,
+                }
+            )
+            return torch.tensor(1.25)
+
+    trainer = FakeTrainer()
+    monkeypatch.setenv("UNSLOTH_RETURN_LOGITS", "1")
+
+    assert _install_experimental_quark_loss_only_evaluation(trainer)
+    assert trainer.args.prediction_loss_only is True
+    loss, logits, labels = trainer.prediction_step(
+        object(),
+        {"labels": torch.ones(7, dtype=torch.long)},
+        prediction_loss_only=False,
+    )
+
+    assert loss.item() == 1.25
+    assert logits is None
+    assert labels is None
+    assert calls == [
+        {"return_logits": "0", "return_outputs": False, "num_items": 7}
+    ]
+    assert os.environ["UNSLOTH_RETURN_LOGITS"] == "1"
+
+
+def test_quark_loss_only_evaluation_requires_an_eval_dataset():
+    trainer = SimpleNamespace(eval_dataset=None)
+    assert not _install_experimental_quark_loss_only_evaluation(trainer)
+    assert not hasattr(trainer, "prediction_step")
+
+
+def test_quark_resume_recreates_serialized_optimizer_state_as_pages():
+    class FakeParameter:
+        device = SimpleNamespace(type="cuda")
+
+    class FakePagedBuffer:
+        is_paged = True
+
+        def __init__(self):
+            self.copied = None
+
+        def copy_(self, value, non_blocking):
+            assert non_blocking is False
+            self.copied = value.clone()
+            return self
+
+    parameter = FakeParameter()
+    state1 = torch.arange(100_000, dtype=torch.uint8)
+    state2 = torch.arange(100_000, dtype=torch.uint8)
+    # torch.save/load preserves these stale attributes even though the loaded
+    # tensors use ordinary CPU storage rather than CUDA managed memory.
+    state1.is_paged = True
+    state2.is_paged = True
+
+    class FakeOptimizer:
+        is_paged = True
+
+        def __init__(self):
+            self.state = {}
+            self.load_move_to_device = None
+            self.buffers = []
+
+        def load_state_dict(self, state_dict, move_to_device=True):
+            self.load_move_to_device = move_to_device
+            self.state = {parameter: dict(state_dict["state"])}
+
+        def get_state_buffer(self, restored_parameter, dtype):
+            assert restored_parameter is parameter
+            assert dtype == torch.uint8
+            buffer = FakePagedBuffer()
+            self.buffers.append(buffer)
+            return buffer
+
+    optimizer = FakeOptimizer()
+
+    class FakeTrainer:
+        def __init__(self):
+            self.optimizer = optimizer
+
+        def _load_optimizer_and_scheduler(self, checkpoint):
+            assert checkpoint == "checkpoint-390"
+            self.optimizer.load_state_dict(
+                {"state": {"state1": state1, "state2": state2}}
+            )
+
+    class FakeAcceleratedOptimizer:
+        def __init__(self, base_optimizer):
+            self.optimizer = base_optimizer
+
+        def load_state_dict(self, state_dict):
+            return self.optimizer.load_state_dict(state_dict)
+
+    base_optimizer = optimizer
+    trainer = FakeTrainer()
+    trainer.optimizer = FakeAcceleratedOptimizer(base_optimizer)
+    assert _install_experimental_quark_paged_optimizer_resume(trainer)
+    trainer._load_optimizer_and_scheduler("checkpoint-390")
+
+    assert optimizer.load_move_to_device is False
+    assert len(optimizer.buffers) == 2
+    assert optimizer.state[parameter]["state1"] is optimizer.buffers[0]
+    assert optimizer.state[parameter]["state2"] is optimizer.buffers[1]
+    assert torch.equal(optimizer.buffers[0].copied, state1)
+    assert torch.equal(optimizer.buffers[1].copied, state2)
+
+
+def test_quark_paged_state_restore_skips_cpu_and_small_buffers():
+    class FakeParameter:
+        def __init__(self, device):
+            self.device = device
+
+    cpu_parameter = FakeParameter(torch.device("cpu"))
+    cuda_parameter = FakeParameter(SimpleNamespace(type="cuda"))
+
+    class FakeOptimizer:
+        state = {
+            cpu_parameter: {"state1": torch.zeros(100_000, dtype=torch.uint8)},
+            cuda_parameter: {"state1": torch.zeros(99_999, dtype=torch.uint8)},
+        }
+
+        @staticmethod
+        def get_state_buffer(parameter, dtype):
+            raise AssertionError("no buffer should be paged")
+
+    assert _restore_paged_optimizer_state_buffers(FakeOptimizer()) == (0, 0)
 
 
 def test_quark_adapter_save_requires_every_lora_pair_and_dense_endpoints(tmp_path):
