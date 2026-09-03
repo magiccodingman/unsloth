@@ -220,6 +220,150 @@ def _restore_paged_optimizer_state_buffers(optimizer: Any) -> tuple[int, int]:
     return restored_count, restored_bytes
 
 
+def _unwrap_paged_optimizer(optimizer: Any) -> Any:
+    """Find the bitsandbytes optimizer below Accelerate-style wrappers."""
+    candidate = optimizer
+    visited = set()
+    while candidate is not None and id(candidate) not in visited:
+        if getattr(candidate, "is_paged", False):
+            return candidate
+        visited.add(id(candidate))
+        candidate = getattr(candidate, "optimizer", None)
+    return None
+
+
+_CUDA_MEM_PREFETCH_ASYNC = None
+
+
+def _cuda_prefetch_managed_tensor_to_cpu(value: torch.Tensor) -> None:
+    """Use CUDA directly because bnb 0.50.2 rejects cudaCpuDeviceId (-1)."""
+    global _CUDA_MEM_PREFETCH_ASYNC
+    if _CUDA_MEM_PREFETCH_ASYNC is None:
+        import ctypes
+
+        cuda_major = str(torch.version.cuda or "12").split(".", 1)[0]
+        try:
+            cudart = ctypes.CDLL(f"libcudart.so.{cuda_major}")
+        except OSError:
+            cudart = ctypes.CDLL("libcudart.so")
+        prefetch = cudart.cudaMemPrefetchAsync
+        prefetch.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+        prefetch.restype = ctypes.c_int
+        _CUDA_MEM_PREFETCH_ASYNC = (prefetch, ctypes)
+
+    prefetch, ctypes = _CUDA_MEM_PREFETCH_ASYNC
+    device_id = getattr(value, "page_deviceid", None)
+    if not isinstance(device_id, int):
+        raise RuntimeError("Paged optimizer tensor is missing page_deviceid")
+    with torch.cuda.device(device_id):
+        result = prefetch(
+            ctypes.c_void_p(value.data_ptr()),
+            ctypes.c_size_t(value.nbytes),
+            ctypes.c_int(-1),  # cudaCpuDeviceId
+            ctypes.c_void_p(0),
+        )
+    if result != 0:
+        raise RuntimeError(
+            "CUDA could not migrate a paged optimizer tensor to CPU "
+            f"(cudaMemPrefetchAsync error {result}, source device {device_id})."
+        )
+
+
+def _evict_paged_optimizer_state_to_cpu(
+    optimizer: Any,
+    *,
+    prefetch_fn: Any = None,
+    synchronize_fn: Any = None,
+    empty_cache_fn: Any = None,
+) -> tuple[int, int]:
+    """Migrate this optimizer's managed state pages off GPUs after an update."""
+    if prefetch_fn is None:
+        prefetch_fn = _cuda_prefetch_managed_tensor_to_cpu
+    if synchronize_fn is None:
+        synchronize_fn = torch.cuda.synchronize
+    if empty_cache_fn is None:
+        def empty_cache_fn(device_id):
+            with torch.cuda.device(device_id):
+                torch.cuda.empty_cache()
+
+    evicted_count = 0
+    evicted_bytes = 0
+    device_ids = set()
+    seen = set()
+    for state in optimizer.state.values():
+        if not isinstance(state, dict):
+            continue
+        for key in ("state1", "state2"):
+            value = state.get(key)
+            if (
+                not isinstance(value, torch.Tensor)
+                or not getattr(value, "is_paged", False)
+                or id(value) in seen
+            ):
+                continue
+            seen.add(id(value))
+            prefetch_fn(value)
+            device_id = getattr(value, "page_deviceid", None)
+            if isinstance(device_id, int):
+                device_ids.add(device_id)
+            evicted_count += 1
+            evicted_bytes += value.numel() * value.element_size()
+
+    for device_id in sorted(device_ids):
+        synchronize_fn(device_id)
+        # Managed pages and inactive caching-allocator segments otherwise race
+        # to occupy all physical VRAM, starving the desktop driver on GPU 0.
+        empty_cache_fn(device_id)
+    return evicted_count, evicted_bytes
+
+
+def _install_experimental_quark_paged_optimizer_eviction(trainer: Any) -> bool:
+    """Keep managed optimizer pages from starving CUDA and the display driver."""
+    if trainer is None or not hasattr(trainer, "create_optimizer"):
+        return False
+    original_create_optimizer = trainer.create_optimizer
+
+    def _create_optimizer_with_eviction(trainer_self, *args, **kwargs):
+        result = original_create_optimizer(*args, **kwargs)
+        optimizer = getattr(trainer_self, "optimizer", None) or result
+        base_optimizer = _unwrap_paged_optimizer(optimizer)
+        if base_optimizer is None or getattr(
+            base_optimizer, "_unsloth_quark_cpu_evict_installed", False
+        ):
+            return result
+
+        original_step = base_optimizer.step
+
+        def _step_with_cpu_eviction(*step_args, **step_kwargs):
+            step_result = original_step(*step_args, **step_kwargs)
+            count, evicted_bytes = _evict_paged_optimizer_state_to_cpu(base_optimizer)
+            if count == 0:
+                raise RuntimeError(
+                    "Experimental Quark CPT could not evict any paged optimizer "
+                    "state after an update; refusing to continue without VRAM headroom."
+                )
+            if not getattr(base_optimizer, "_unsloth_quark_cpu_evict_logged", False):
+                logger.info(
+                    "Experimental Quark CPT: evicted "
+                    f"{count} optimizer state buffers ({evicted_bytes / 2**30:.6f} GiB) "
+                    "to CPU after the optimizer update.\n"
+                )
+                base_optimizer._unsloth_quark_cpu_evict_logged = True
+            return step_result
+
+        base_optimizer.step = _step_with_cpu_eviction
+        base_optimizer._unsloth_quark_cpu_evict_installed = True
+        return result
+
+    trainer.create_optimizer = types.MethodType(_create_optimizer_with_eviction, trainer)
+    return True
+
+
 def _install_experimental_quark_paged_optimizer_resume(trainer: Any) -> bool:
     """Preserve bitsandbytes paging when Transformers restores optimizer.pt."""
     if trainer is None or not hasattr(trainer, "_load_optimizer_and_scheduler"):
@@ -228,16 +372,8 @@ def _install_experimental_quark_paged_optimizer_resume(trainer: Any) -> bool:
 
     def _paged_restore(trainer_self, checkpoint):
         optimizer = getattr(trainer_self, "optimizer", None)
-        base_optimizer = optimizer
-        visited = set()
-        while (
-            base_optimizer is not None
-            and id(base_optimizer) not in visited
-            and not getattr(base_optimizer, "is_paged", False)
-        ):
-            visited.add(id(base_optimizer))
-            base_optimizer = getattr(base_optimizer, "optimizer", None)
-        if checkpoint is None or not getattr(base_optimizer, "is_paged", False):
+        base_optimizer = _unwrap_paged_optimizer(optimizer)
+        if checkpoint is None or base_optimizer is None:
             return original_restore(checkpoint)
 
         original_load_state_dict = base_optimizer.load_state_dict
@@ -4648,6 +4784,7 @@ class UnslothTrainer:
                     "near-8K rows do not materialize full FP32 vocabulary logits.\n"
                 )
             if self._experimental_quark_qlora:
+                _install_experimental_quark_paged_optimizer_eviction(self.trainer)
                 _install_experimental_quark_paged_optimizer_resume(self.trainer)
             logger.info("Trainer initialized\n")
 

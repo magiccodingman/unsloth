@@ -11,6 +11,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+import core.training.trainer as trainer_module
 from core.training.trainer import (
     EXPERIMENTAL_QUARK_ACTIVATION_CHUNK_SIZE,
     EXPERIMENTAL_QUARK_FIRST_CUDA_LAYER_COUNT,
@@ -19,7 +20,9 @@ from core.training.trainer import (
     UnslothTrainer,
     _build_experimental_quark_device_map,
     _configure_experimental_quark_fused_ce_workspace,
+    _evict_paged_optimizer_state_to_cpu,
     _install_experimental_quark_loss_only_evaluation,
+    _install_experimental_quark_paged_optimizer_eviction,
     _install_experimental_quark_paged_optimizer_resume,
     _is_supported_local_quark_qwen35_checkpoint,
     _restore_paged_optimizer_state_buffers,
@@ -289,6 +292,79 @@ def test_quark_paged_state_restore_skips_cpu_and_small_buffers():
             raise AssertionError("no buffer should be paged")
 
     assert _restore_paged_optimizer_state_buffers(FakeOptimizer()) == (0, 0)
+
+
+def test_quark_paged_optimizer_state_is_evicted_after_each_step(monkeypatch):
+    state1 = torch.zeros(100_000, dtype=torch.uint8)
+    state2 = torch.zeros(200_000, dtype=torch.uint8)
+    state1.is_paged = True
+    state1.page_deviceid = 1
+    state2.is_paged = True
+    state2.page_deviceid = 0
+    calls = []
+
+    class FakeOptimizer:
+        is_paged = True
+
+        def __init__(self):
+            self.state = {object(): {"state1": state1, "state2": state2}}
+
+        @staticmethod
+        def step():
+            calls.append("step")
+            return "updated"
+
+    class FakeTrainer:
+        optimizer = None
+
+        def create_optimizer(self):
+            self.optimizer = FakeOptimizer()
+            return self.optimizer
+
+    def prefetch(value):
+        calls.append(("prefetch", value.page_deviceid))
+
+    def synchronize(device_id):
+        calls.append(("synchronize", device_id))
+
+    def empty_cache(device_id):
+        calls.append(("empty_cache", device_id))
+
+    optimizer = FakeOptimizer()
+    assert _evict_paged_optimizer_state_to_cpu(
+        optimizer,
+        prefetch_fn=prefetch,
+        synchronize_fn=synchronize,
+        empty_cache_fn=empty_cache,
+    ) == (2, 300_000)
+    assert calls == [
+        ("prefetch", 1),
+        ("prefetch", 0),
+        ("synchronize", 0),
+        ("empty_cache", 0),
+        ("synchronize", 1),
+        ("empty_cache", 1),
+    ]
+
+    calls.clear()
+    trainer = FakeTrainer()
+    assert _install_experimental_quark_paged_optimizer_eviction(trainer)
+    created = trainer.create_optimizer()
+    monkeypatch.setattr(
+        trainer_module,
+        "_evict_paged_optimizer_state_to_cpu",
+        lambda candidate: (2, 300_000),
+    )
+    assert created.step() == "updated"
+    assert calls == ["step"]
+
+    monkeypatch.setattr(
+        trainer_module,
+        "_evict_paged_optimizer_state_to_cpu",
+        lambda candidate: (0, 0),
+    )
+    with pytest.raises(RuntimeError, match="could not evict any paged optimizer state"):
+        created.step()
 
 
 def test_quark_adapter_save_requires_every_lora_pair_and_dense_endpoints(tmp_path):
