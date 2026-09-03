@@ -14,10 +14,12 @@ from core.training.trainer import (
     EXPERIMENTAL_QUARK_ACTIVATION_CHUNK_SIZE,
     EXPERIMENTAL_QUARK_FIRST_CUDA_LAYER_COUNT,
     EXPERIMENTAL_QUARK_FUSED_CE_TARGET_GB,
+    EXPERIMENTAL_QUARK_OPTIMIZER,
     UnslothTrainer,
     _build_experimental_quark_device_map,
     _configure_experimental_quark_fused_ce_workspace,
     _is_supported_local_quark_qwen35_checkpoint,
+    _resolve_experimental_quark_optimizer,
 )
 
 
@@ -104,6 +106,26 @@ def test_quark_device_map_keeps_dense_endpoints_apart_and_favors_clean_gpu():
         for name, device in device_map.items()
         if "language_model.layers." in name
     ) == 36
+
+
+def test_quark_dense_vocab_cpt_pages_adamw8bit_state():
+    assert EXPERIMENTAL_QUARK_OPTIMIZER == "paged_adamw_8bit"
+    assert (
+        _resolve_experimental_quark_optimizer("adamw_8bit", enabled=True)
+        == EXPERIMENTAL_QUARK_OPTIMIZER
+    )
+    assert (
+        _resolve_experimental_quark_optimizer("paged_adamw_8bit", enabled=True)
+        == EXPERIMENTAL_QUARK_OPTIMIZER
+    )
+    assert (
+        _resolve_experimental_quark_optimizer("adamw_8bit", enabled=False)
+        == "adamw_8bit"
+    )
+    assert (
+        _resolve_experimental_quark_optimizer("adamw_torch", enabled=True)
+        == "adamw_torch"
+    )
 
 
 def test_quark_adapter_save_requires_every_lora_pair_and_dense_endpoints(tmp_path):

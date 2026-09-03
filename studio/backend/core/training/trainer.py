@@ -107,6 +107,7 @@ STREAMING_EVAL_MAX_SAMPLES = 500
 EXPERIMENTAL_QUARK_FUSED_CE_TARGET_GB = 0.25
 EXPERIMENTAL_QUARK_ACTIVATION_CHUNK_SIZE = 2048
 EXPERIMENTAL_QUARK_FIRST_CUDA_LAYER_COUNT = 28
+EXPERIMENTAL_QUARK_OPTIMIZER = "paged_adamw_8bit"
 
 
 def _configure_experimental_quark_fused_ce_workspace() -> float:
@@ -134,6 +135,13 @@ def _configure_experimental_quark_fused_ce_workspace() -> float:
     else:
         fused_ce.TARGET_GB = value
     return effective
+
+
+def _resolve_experimental_quark_optimizer(optimizer: Any, enabled: bool) -> Any:
+    """Page AdamW8bit state for the validated dense-vocabulary Quark topology."""
+    if enabled and str(optimizer).strip().lower() == "adamw_8bit":
+        return EXPERIMENTAL_QUARK_OPTIMIZER
+    return optimizer
 
 
 def _build_experimental_quark_device_map() -> dict[str, int]:
@@ -4315,7 +4323,18 @@ class UnslothTrainer:
                 logger.info("No eval dataset — evaluation disabled\n")
 
             # Use training_args optim/lr_scheduler_type if given, else defaults
-            optim_value = training_args.get("optim", "adamw_8bit")
+            requested_optim_value = training_args.get("optim", "adamw_8bit")
+            optim_value = _resolve_experimental_quark_optimizer(
+                requested_optim_value,
+                self._experimental_quark_qlora,
+            )
+            if optim_value != requested_optim_value:
+                logger.warning(
+                    "Experimental Quark dense-vocabulary CPT: replacing "
+                    f"optimizer {requested_optim_value!r} with {optim_value!r}. "
+                    "Both use bitsandbytes 8-bit AdamW updates; paging is required "
+                    "to keep optimizer state from exhausting CUDA memory.\n"
+                )
             lr_scheduler_type_value = training_args.get("lr_scheduler_type", "linear")
 
             if (self.is_vlm or self.is_audio_vlm) and not raw_text_mode:
