@@ -52,13 +52,23 @@ def _quark_chunked_base_forward(base_layer, x, chunk_size, *args, **kwargs):
     return output.reshape(*x.shape[:-1], output.shape[-1])
 
 
-def _quark_forward_with_cache_release(self, *args, **kwargs):
-    """Release allocator cache at the safe outer forward/backward boundary."""
-    outputs = self._unsloth_quark_original_forward(*args, **kwargs)
+def _release_quark_cuda_cache() -> None:
+    """Finish queued multi-GPU work and release inactive cache on every device."""
     if torch.cuda.is_available():
         for device_index in range(torch.cuda.device_count()):
             torch.cuda.synchronize(device_index)
-        torch.cuda.empty_cache()
+            with torch.cuda.device(device_index):
+                torch.cuda.empty_cache()
+
+
+def _quark_forward_with_cache_release(self, *args, **kwargs):
+    """Bound inactive cache and async work around each accumulated forward."""
+    # The previous microbatch's backward is asynchronous.  Finish it and return
+    # its inactive allocator segments before the next forward starts, rather
+    # than allowing eight accumulation cycles to pressure the display GPU.
+    _release_quark_cuda_cache()
+    outputs = self._unsloth_quark_original_forward(*args, **kwargs)
+    _release_quark_cuda_cache()
     return outputs
 
 

@@ -4,11 +4,31 @@ import types
 
 import torch
 
+import unsloth.models.quark as quark_module
 from unsloth.models.quark import (
     _quark_chunked_base_forward,
+    _quark_forward_with_cache_release,
     _quark_lora_forward,
     is_quark_qwen35_mxfp4_config,
 )
+
+
+def test_quark_forward_releases_cache_before_and_after_each_microbatch(monkeypatch):
+    calls = []
+
+    class Model:
+        @staticmethod
+        def _unsloth_quark_original_forward(value):
+            calls.append(("forward", value))
+            return value + 1
+
+    monkeypatch.setattr(
+        quark_module,
+        "_release_quark_cuda_cache",
+        lambda: calls.append("release"),
+    )
+    assert _quark_forward_with_cache_release(Model(), 41) == 42
+    assert calls == ["release", ("forward", 41), "release"]
 
 
 def _supported_config():

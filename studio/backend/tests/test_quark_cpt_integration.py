@@ -20,6 +20,7 @@ from core.training.trainer import (
     UnslothTrainer,
     _build_experimental_quark_device_map,
     _configure_experimental_quark_fused_ce_workspace,
+    _disable_experimental_quark_double_buffering,
     _evict_paged_optimizer_state_to_cpu,
     _install_experimental_quark_loss_only_evaluation,
     _install_experimental_quark_paged_optimizer_eviction,
@@ -98,21 +99,38 @@ def test_quark_device_map_keeps_dense_endpoints_apart_and_favors_clean_gpu():
 
     assert EXPERIMENTAL_QUARK_FUSED_CE_TARGET_GB == 0.25
     assert EXPERIMENTAL_QUARK_ACTIVATION_CHUNK_SIZE == 2048
-    assert EXPERIMENTAL_QUARK_FIRST_CUDA_LAYER_COUNT == 28
+    assert EXPERIMENTAL_QUARK_FIRST_CUDA_LAYER_COUNT == 26
     assert device_map["model.language_model.embed_tokens"] == 0
     assert device_map["lm_head"] == 1
-    assert device_map["model.language_model.layers.27"] == 0
-    assert device_map["model.language_model.layers.28"] == 1
+    assert device_map["model.language_model.layers.25"] == 0
+    assert device_map["model.language_model.layers.26"] == 1
     assert sum(
         device == 0
         for name, device in device_map.items()
         if "language_model.layers." in name
-    ) == 28
+    ) == 26
     assert sum(
         device == 1
         for name, device in device_map.items()
         if "language_model.layers." in name
-    ) == 36
+    ) == 38
+
+
+def test_quark_disables_zoo_double_buffering_and_clears_cached_choice(monkeypatch):
+    calls = []
+    fake_disabled = SimpleNamespace(cache_clear=lambda: calls.append("clear"))
+    fake_module = SimpleNamespace(_double_buffer_disabled=fake_disabled)
+    monkeypatch.setitem(
+        trainer_module.sys.modules,
+        "unsloth_zoo.gradient_checkpointing",
+        fake_module,
+    )
+    monkeypatch.setenv("UNSLOTH_DISABLE_DOUBLE_BUFFER", "0")
+
+    _disable_experimental_quark_double_buffering()
+
+    assert os.environ["UNSLOTH_DISABLE_DOUBLE_BUFFER"] == "1"
+    assert calls == ["clear"]
 
 
 def test_quark_dense_vocab_cpt_pages_adamw8bit_state():

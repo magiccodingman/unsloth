@@ -106,7 +106,7 @@ STREAMING_EVAL_MAX_SAMPLES = 500
 # parameters or the loss definition.
 EXPERIMENTAL_QUARK_FUSED_CE_TARGET_GB = 0.25
 EXPERIMENTAL_QUARK_ACTIVATION_CHUNK_SIZE = 2048
-EXPERIMENTAL_QUARK_FIRST_CUDA_LAYER_COUNT = 28
+EXPERIMENTAL_QUARK_FIRST_CUDA_LAYER_COUNT = 26
 EXPERIMENTAL_QUARK_OPTIMIZER = "paged_adamw_8bit"
 
 
@@ -424,6 +424,25 @@ def _build_experimental_quark_device_map() -> dict[str, int]:
             0 if layer_index < EXPERIMENTAL_QUARK_FIRST_CUDA_LAYER_COUNT else 1
         )
     return device_map
+
+
+def _disable_experimental_quark_double_buffering() -> None:
+    """Use Zoo's single-buffer checkpoint reload for the packed Quark path."""
+    # Quark's W4A4 recompute kernels already cross two CUDA devices. Do not add
+    # Zoo's opportunistic second activation buffer and copy-stream overlap: the
+    # resulting shared-buffer lifetime is not validated with these custom
+    # kernels and is a plausible contributor to the rare, nondeterministic Xid
+    # 31 faults observed in long CPT runs. Single-buffer offload remains enabled.
+    os.environ["UNSLOTH_DISABLE_DOUBLE_BUFFER"] = "1"
+
+    # Zoo caches this setting on first gradient-checkpoint initialization. The
+    # Studio worker normally reaches this before initialization, but clearing a
+    # pre-existing cache makes the narrow safety setting deterministic.
+    gradient_checkpointing = sys.modules.get("unsloth_zoo.gradient_checkpointing")
+    disabled = getattr(gradient_checkpointing, "_double_buffer_disabled", None)
+    cache_clear = getattr(disabled, "cache_clear", None)
+    if cache_clear is not None:
+        cache_clear()
 
 
 def _is_supported_local_quark_qwen35_checkpoint(model_path: str) -> bool:
@@ -1441,13 +1460,15 @@ class UnslothTrainer:
                     )
                 allocator_setter(allocator_config)
                 os.environ["PYTORCH_ALLOC_CONF"] = allocator_config
+                _disable_experimental_quark_double_buffering()
                 fused_ce_target_gb = _configure_experimental_quark_fused_ce_workspace()
                 device_map = _build_experimental_quark_device_map()
                 logger.info(
                     "Using the measured dense-endpoint Quark placement: "
-                    "layers 0-27 plus embeddings on cuda:0; layers 28-63 plus lm_head on cuda:1; "
+                    "layers 0-25 plus embeddings on cuda:0; layers 26-63 plus lm_head on cuda:1; "
                     f"fused-CE target={fused_ce_target_gb:.3g} GiB; "
-                    "expandable CUDA allocator segments enabled."
+                    "expandable CUDA allocator segments enabled; "
+                    "gradient-checkpoint reload double buffering disabled."
                 )
 
             if self._audio_type == "csm":
