@@ -106,7 +106,7 @@ STREAMING_EVAL_MAX_SAMPLES = 500
 # parameters or the loss definition.
 EXPERIMENTAL_QUARK_FUSED_CE_TARGET_GB = 0.25
 EXPERIMENTAL_QUARK_ACTIVATION_CHUNK_SIZE = 2048
-EXPERIMENTAL_QUARK_FIRST_CUDA_LAYER_COUNT = 26
+EXPERIMENTAL_QUARK_FIRST_CUDA_LAYER_COUNT = 28
 EXPERIMENTAL_QUARK_OPTIMIZER = "paged_adamw_8bit"
 
 
@@ -1465,7 +1465,7 @@ class UnslothTrainer:
                 device_map = _build_experimental_quark_device_map()
                 logger.info(
                     "Using the measured dense-endpoint Quark placement: "
-                    "layers 0-25 plus embeddings on cuda:0; layers 26-63 plus lm_head on cuda:1; "
+                    "layers 0-27 plus embeddings on cuda:0; layers 28-63 plus lm_head on cuda:1; "
                     f"fused-CE target={fused_ce_target_gb:.3g} GiB; "
                     "expandable CUDA allocator segments enabled; "
                     "gradient-checkpoint reload double buffering disabled."
