@@ -21,6 +21,15 @@ from ._flash_attention_compat import fix_transformers_flash_attention_packed_seq
 fix_transformers_flash_attention_packed_sequence_detection()
 del fix_transformers_flash_attention_packed_sequence_detection
 
+# Studio's multi-GPU loader asks for an Unsloth planned map but does not expose
+# device_map_planner_kwargs. Install opt-in environment overrides before model
+# implementations import the resolver, so spawned Studio training workers inherit
+# the same planner hints without changing default placement for anybody else.
+from ._device_map_env import install_device_map_environment_overrides
+
+install_device_map_environment_overrides()
+del install_device_map_environment_overrides
+
 from .llama import FastLlamaModel
 from .loader import FastLanguageModel, FastVisionModel, FastTextModel, FastModel
 from .mistral import FastMistralModel

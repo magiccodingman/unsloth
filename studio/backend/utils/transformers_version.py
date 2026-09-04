@@ -963,10 +963,66 @@ def _config_matches_tier(cfg: dict, architectures: set[str], model_types: set[st
 
 
 def _config_needs_550(cfg: dict) -> bool:
-    return _config_matches_tier(
+    if _config_matches_tier(
         cfg,
         _TRANSFORMERS_550_ARCHITECTURES,
         _TRANSFORMERS_550_MODEL_TYPES,
+    ):
+        return True
+    return _config_is_supported_packed_quark_qwen35(cfg)
+
+
+def _config_is_supported_packed_quark_qwen35(cfg: dict) -> bool:
+    """Route the validated packed Quark Qwen3.5 checkpoint to Transformers 5.5.
+
+    Transformers 5.3's Quark deserializer leaves ``weight_scale`` checkpoint
+    tensors unmatched and retains FP32 placeholder scales. Transformers 5.5
+    renames those sidecars to ``weight_quantizer.scale`` before deserialization.
+    Keep this version override as narrow as the experimental training path.
+    """
+    if not isinstance(cfg, dict):
+        return False
+    text_config = cfg.get("text_config")
+    quantization_config = cfg.get("quantization_config")
+    if not isinstance(text_config, dict) or not isinstance(quantization_config, dict):
+        return False
+    native_quant_config = quantization_config.get("quant_config")
+    if not isinstance(native_quant_config, dict):
+        native_quant_config = quantization_config
+    global_config = native_quant_config.get("global_quant_config")
+    weight = global_config.get("weight") if isinstance(global_config, dict) else None
+    inputs = global_config.get("input_tensors") if isinstance(global_config, dict) else None
+    export = quantization_config.get("json_export_config")
+    if not isinstance(export, dict):
+        export = quantization_config.get("export")
+    architectures = cfg.get("architectures")
+    if not (
+        isinstance(architectures, (list, tuple))
+        and isinstance(weight, dict)
+        and isinstance(inputs, dict)
+        and isinstance(export, dict)
+    ):
+        return False
+    return all(
+        (
+            cfg.get("model_type") == "qwen3_5",
+            "Qwen3_5ForConditionalGeneration" in architectures,
+            text_config.get("model_type") == "qwen3_5_text",
+            text_config.get("num_hidden_layers") == 64,
+            text_config.get("hidden_size") == 5120,
+            text_config.get("vocab_size") == 248320,
+            quantization_config.get("quant_method") == "quark",
+            native_quant_config.get("quant_mode") == "eager_mode",
+            weight.get("dtype") == "fp4",
+            weight.get("group_size") == 32,
+            weight.get("scale_format") == "e8m0",
+            weight.get("is_dynamic") is False,
+            inputs.get("dtype") == "fp4",
+            inputs.get("group_size") == 32,
+            inputs.get("scale_format") == "e8m0",
+            inputs.get("is_dynamic") is True,
+            export.get("weight_format") == "real_quantized",
+        )
     )
 
 

@@ -346,12 +346,13 @@ export function TrainModelSelector({
       }
       if (
         classifyUnslothSupport({
-          modelId: row.repoId ?? row.loadId,
+          modelId: row.path,
           pipelineTag: row.pipelineTag,
           tags: row.tags,
           libraryName: row.libraryName,
           quantMethod: row.quantMethod,
           deviceType,
+          allowExperimentalPackedQuarkTraining: true,
         }).status === "unsupported"
       ) {
         return false;

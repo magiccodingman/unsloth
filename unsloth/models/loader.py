@@ -457,6 +457,8 @@ class FastLanguageModel(FastLlamaModel):
         load_in_fp8 = False,  # fp8 LoRA (True, False, 'block')
         unsloth_tiled_mlp = False,
         text_only = False,  # Skip vision/audio towers and load only the text decoder
+        experimental_quark_qlora = False,
+        experimental_quark_offload_frozen_vision = False,
         *args,
         **kwargs,
     ):
@@ -498,7 +500,7 @@ class FastLanguageModel(FastLlamaModel):
         # Distributed-safe device placement for quantized models.
         # In multi-GPU (torchrun), each rank must load the model on its own device
         # to avoid Accelerate device relocation errors with quantized weights.
-        is_quantized = load_in_4bit or load_in_8bit or load_in_fp8
+        is_quantized = load_in_4bit or load_in_8bit or load_in_fp8 or experimental_quark_qlora
         device_map = requested_device_map(device_map)
         if is_quantized and isinstance(device_map, str):
             distributed_device_map, is_dist = prepare_device_map()
@@ -542,6 +544,10 @@ class FastLanguageModel(FastLlamaModel):
                 load_in_fp8 = load_in_fp8,
                 unsloth_tiled_mlp = unsloth_tiled_mlp,
                 text_only = text_only,
+                experimental_quark_qlora = experimental_quark_qlora,
+                experimental_quark_offload_frozen_vision=(
+                    experimental_quark_offload_frozen_vision
+                ),
                 *args,
                 **kwargs,
             )
@@ -996,6 +1002,10 @@ class FastLanguageModel(FastLlamaModel):
                 load_in_fp8 = load_in_fp8,
                 unsloth_tiled_mlp = unsloth_tiled_mlp,
                 text_only = text_only,
+                experimental_quark_qlora = experimental_quark_qlora,
+                experimental_quark_offload_frozen_vision=(
+                    experimental_quark_offload_frozen_vision
+                ),
                 *args,
                 **kwargs,
             )
@@ -1296,6 +1306,8 @@ class FastModel(FastBaseModel):
         unsloth_tiled_mlp = False,
         target_parameters = None,  # For MoE expert parameters
         text_only = False,  # Skip vision/audio towers and load only the text decoder
+        experimental_quark_qlora = False,
+        experimental_quark_offload_frozen_vision = False,
         *args,
         **kwargs,
     ):
@@ -1425,7 +1437,7 @@ class FastModel(FastBaseModel):
         # Distributed-safe device placement for quantized models.
         # In multi-GPU (torchrun), each rank must load the model on its own device
         # to avoid Accelerate device relocation errors with quantized weights.
-        is_quantized = load_in_4bit or load_in_8bit or load_in_fp8
+        is_quantized = load_in_4bit or load_in_8bit or load_in_fp8 or experimental_quark_qlora
         device_map = requested_device_map(device_map)
         if is_quantized and isinstance(device_map, str):
             distributed_device_map, is_dist = prepare_device_map()
@@ -2141,6 +2153,10 @@ class FastModel(FastBaseModel):
             load_in_fp8 = load_in_fp8,
             text_only = load_text_only,
             text_only_decoder = text_only_decoder,
+            experimental_quark_qlora = experimental_quark_qlora,
+            experimental_quark_offload_frozen_vision=(
+                experimental_quark_offload_frozen_vision
+            ),
             *args,
             **kwargs,
         )

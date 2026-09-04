@@ -178,6 +178,41 @@ function repoLeaf(modelId: string): string {
   return parts.at(-1) ?? modelId;
 }
 
+const EXPERIMENTAL_PACKED_QUARK_TRAINING_CHECKPOINT =
+  "qwen3.8-27b-quark-awq-mxfp4-amd";
+const WINDOWS_ABSOLUTE_PATH_PATTERN = /^[a-z]:[\\/]/i;
+
+function isAbsoluteLocalPath(value: string): boolean {
+  const trimmed = value.trim();
+  return (
+    trimmed.startsWith("/") ||
+    trimmed.startsWith("\\\\") ||
+    WINDOWS_ABSOLUTE_PATH_PATTERN.test(trimmed)
+  );
+}
+
+/**
+ * UI-only admission for the one local packed-Quark representation whose
+ * backend loader performs exact config and tensor validation. This does not
+ * make arbitrary AWQ/Quark models supported, and it deliberately excludes Hub
+ * IDs so a similarly named remote repo cannot bypass the normal format gate.
+ */
+function isExperimentalPackedQuarkTrainingCandidate(
+  modelId: string | null | undefined,
+  quantMethod: string | null,
+): boolean {
+  if (!(modelId && isAbsoluteLocalPath(modelId))) {
+    return false;
+  }
+  if (
+    repoLeaf(modelId).toLowerCase() !==
+    EXPERIMENTAL_PACKED_QUARK_TRAINING_CHECKPOINT
+  ) {
+    return false;
+  }
+  return quantMethod === null || quantMethod === "quark";
+}
+
 function detectFormatKey(
   modelId: string | null | undefined,
   lowerTags: ReadonlySet<string>,
@@ -206,6 +241,7 @@ export function classifyUnslothSupport({
   libraryName,
   deviceType,
   quantMethod,
+  allowExperimentalPackedQuarkTraining = false,
 }: {
   modelId?: string | null;
   pipelineTag?: string | null;
@@ -213,6 +249,7 @@ export function classifyUnslothSupport({
   libraryName?: string | null;
   deviceType?: string | null;
   quantMethod?: string | null;
+  allowExperimentalPackedQuarkTraining?: boolean;
 }): UnslothSupport {
   const pipeline = pipelineTag?.toLowerCase().trim() || null;
   const lowerTags = new Set(
@@ -228,6 +265,14 @@ export function classifyUnslothSupport({
     lowerTags.has("gguf") ||
     library === "gguf" ||
     (modelId ? /(?:^|[-_.])gguf$/i.test(repoLeaf(modelId)) : false);
+
+  if (
+    allowExperimentalPackedQuarkTraining &&
+    !isGguf &&
+    isExperimentalPackedQuarkTrainingCandidate(modelId, normalizedQuant)
+  ) {
+    return { status: "supported", reason: null };
+  }
 
   if (normalizedQuant && !isGguf) {
     if (SUPPORTED_QUANT_METHODS.has(normalizedQuant)) {
@@ -265,7 +310,8 @@ export function classifyUnslothSupport({
   }
   const formatKey = detectFormatKey(modelId, lowerTags);
   if (formatKey && formatTags.has(formatKey)) {
-    const label = FORMAT_TAG_LABEL[formatKey] ?? `${formatKey.toUpperCase()} weights`;
+    const label =
+      FORMAT_TAG_LABEL[formatKey] ?? `${formatKey.toUpperCase()} weights`;
     return {
       status: "unsupported",
       reason: `Detected ${label}.`,

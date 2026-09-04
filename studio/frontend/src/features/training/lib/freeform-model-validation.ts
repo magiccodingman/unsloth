@@ -63,6 +63,7 @@ export function validateTrainingModelCandidate(
     libraryName: candidate.libraryName,
     quantMethod: candidate.quantMethod,
     deviceType: options.deviceType,
+    allowExperimentalPackedQuarkTraining: true,
   });
   if (support.status === "unsupported") {
     return {

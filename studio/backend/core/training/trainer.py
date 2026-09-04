@@ -98,6 +98,374 @@ logger = get_logger(__name__)
 # source on every eval step. Cap it so each evaluation terminates.
 STREAMING_EVAL_MAX_SAMPLES = 500
 
+# Empirical limits for the exact packed-Qwen topology accepted below. Dense
+# vocabulary training creates one 2.37 GiB gradient on each endpoint GPU. The
+# fused CE default can create another full-size lm_head gradient plus a large
+# logits workspace, while Quark's W4A4 emulation needs a sequence-linear
+# activation temporary. These bounds change chunking only, not trainable
+# parameters or the loss definition.
+EXPERIMENTAL_QUARK_FUSED_CE_TARGET_GB = 0.25
+EXPERIMENTAL_QUARK_ACTIVATION_CHUNK_SIZE = 2048
+EXPERIMENTAL_QUARK_FIRST_CUDA_LAYER_COUNT = 28
+EXPERIMENTAL_QUARK_OPTIMIZER = "paged_adamw_8bit"
+
+
+def _configure_experimental_quark_fused_ce_workspace() -> float:
+    """Cap fused-CE workspace in this per-job process for dense-head Quark CPT."""
+    configured = os.environ.get("UNSLOTH_CE_LOSS_TARGET_GB")
+    try:
+        configured_value = float(configured) if configured is not None else None
+    except (TypeError, ValueError):
+        configured_value = None
+    if configured_value is None or configured_value <= 0:
+        effective = EXPERIMENTAL_QUARK_FUSED_CE_TARGET_GB
+    else:
+        effective = min(configured_value, EXPERIMENTAL_QUARK_FUSED_CE_TARGET_GB)
+    value = str(effective)
+    os.environ["UNSLOTH_CE_LOSS_TARGET_GB"] = value
+
+    # unsloth_zoo reads the environment variable at module import time. Studio
+    # has normally imported it already, so update that cached module setting too.
+    try:
+        import importlib
+
+        fused_ce = importlib.import_module("unsloth_zoo.fused_losses.cross_entropy_loss")
+    except ImportError:
+        pass
+    else:
+        fused_ce.TARGET_GB = value
+    return effective
+
+
+def _resolve_experimental_quark_optimizer(optimizer: Any, enabled: bool) -> Any:
+    """Page AdamW8bit state for the validated dense-vocabulary Quark topology."""
+    if enabled and str(optimizer).strip().lower() == "adamw_8bit":
+        return EXPERIMENTAL_QUARK_OPTIMIZER
+    return optimizer
+
+
+def _install_experimental_quark_loss_only_evaluation(trainer: Any) -> bool:
+    """Keep periodic Quark evaluation on the chunked loss path, without logits.
+
+    Unsloth globally replaces Transformers' prediction_step and forces
+    UNSLOTH_RETURN_LOGITS=1 before it checks prediction_loss_only. A single
+    near-8K row for this 248,320-token vocabulary then materializes a 7.33 GiB
+    FP32 logits tensor. Studio only consumes eval_loss here, so compute exactly
+    that and return no predictions.
+    """
+    if trainer is None or getattr(trainer, "eval_dataset", None) is None:
+        return False
+
+    trainer.args.prediction_loss_only = True
+
+    def _loss_only_prediction_step(
+        trainer_self,
+        model,
+        inputs,
+        prediction_loss_only,
+        ignore_keys = None,
+    ):
+        del prediction_loss_only, ignore_keys
+        inputs = trainer_self._prepare_inputs(inputs)
+        previous_return_logits = os.environ.get("UNSLOTH_RETURN_LOGITS")
+        os.environ["UNSLOTH_RETURN_LOGITS"] = "0"
+        try:
+            with torch.no_grad():
+                with trainer_self.compute_loss_context_manager():
+                    try:
+                        num_items_in_batch = trainer_self._get_num_items_in_batch(
+                            [inputs], trainer_self.args.device
+                        )
+                    except (AttributeError, TypeError):
+                        num_items_in_batch = None
+                    loss = trainer_self.compute_loss(
+                        model,
+                        inputs,
+                        return_outputs = False,
+                        num_items_in_batch = num_items_in_batch,
+                    )
+            return loss.detach().mean(), None, None
+        finally:
+            if previous_return_logits is None:
+                os.environ.pop("UNSLOTH_RETURN_LOGITS", None)
+            else:
+                os.environ["UNSLOTH_RETURN_LOGITS"] = previous_return_logits
+
+    trainer.prediction_step = types.MethodType(_loss_only_prediction_step, trainer)
+    return True
+
+
+def _restore_paged_optimizer_state_buffers(optimizer: Any) -> tuple[int, int]:
+    """Recreate serialized bitsandbytes state1/state2 as managed CUDA pages."""
+    restored_count = 0
+    restored_bytes = 0
+    for parameter, state in optimizer.state.items():
+        if getattr(getattr(parameter, "device", None), "type", None) != "cuda":
+            continue
+        if not isinstance(state, dict):
+            continue
+        for key in ("state1", "state2"):
+            value = state.get(key)
+            if not isinstance(value, torch.Tensor) or value.numel() < 100_000:
+                continue
+            # torch.save preserves bitsandbytes' Python attributes such as
+            # is_paged=True, but torch.load reconstructs ordinary CPU storage.
+            # Never trust the serialized flag here; get_state_buffer is what
+            # creates a fresh CUDA managed-memory allocation.
+            paged_value = optimizer.get_state_buffer(parameter, dtype = value.dtype)
+            paged_value.copy_(value, non_blocking = False)
+            state[key] = paged_value
+            restored_count += 1
+            restored_bytes += value.numel() * value.element_size()
+    return restored_count, restored_bytes
+
+
+def _unwrap_paged_optimizer(optimizer: Any) -> Any:
+    """Find the bitsandbytes optimizer below Accelerate-style wrappers."""
+    candidate = optimizer
+    visited = set()
+    while candidate is not None and id(candidate) not in visited:
+        if getattr(candidate, "is_paged", False):
+            return candidate
+        visited.add(id(candidate))
+        candidate = getattr(candidate, "optimizer", None)
+    return None
+
+
+_CUDA_MEM_PREFETCH_ASYNC = None
+
+
+def _cuda_prefetch_managed_tensor_to_cpu(value: torch.Tensor) -> None:
+    """Use CUDA directly because bnb 0.50.2 rejects cudaCpuDeviceId (-1)."""
+    global _CUDA_MEM_PREFETCH_ASYNC
+    if _CUDA_MEM_PREFETCH_ASYNC is None:
+        import ctypes
+
+        cuda_major = str(torch.version.cuda or "12").split(".", 1)[0]
+        try:
+            cudart = ctypes.CDLL(f"libcudart.so.{cuda_major}")
+        except OSError:
+            cudart = ctypes.CDLL("libcudart.so")
+        prefetch = cudart.cudaMemPrefetchAsync
+        prefetch.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+        prefetch.restype = ctypes.c_int
+        _CUDA_MEM_PREFETCH_ASYNC = (prefetch, ctypes)
+
+    prefetch, ctypes = _CUDA_MEM_PREFETCH_ASYNC
+    device_id = getattr(value, "page_deviceid", None)
+    if not isinstance(device_id, int):
+        raise RuntimeError("Paged optimizer tensor is missing page_deviceid")
+    with torch.cuda.device(device_id):
+        result = prefetch(
+            ctypes.c_void_p(value.data_ptr()),
+            ctypes.c_size_t(value.nbytes),
+            ctypes.c_int(-1),  # cudaCpuDeviceId
+            ctypes.c_void_p(0),
+        )
+    if result != 0:
+        raise RuntimeError(
+            "CUDA could not migrate a paged optimizer tensor to CPU "
+            f"(cudaMemPrefetchAsync error {result}, source device {device_id})."
+        )
+
+
+def _evict_paged_optimizer_state_to_cpu(
+    optimizer: Any,
+    *,
+    prefetch_fn: Any = None,
+    synchronize_fn: Any = None,
+    empty_cache_fn: Any = None,
+) -> tuple[int, int]:
+    """Migrate this optimizer's managed state pages off GPUs after an update."""
+    if prefetch_fn is None:
+        prefetch_fn = _cuda_prefetch_managed_tensor_to_cpu
+    if synchronize_fn is None:
+        synchronize_fn = torch.cuda.synchronize
+    if empty_cache_fn is None:
+        def empty_cache_fn(device_id):
+            with torch.cuda.device(device_id):
+                torch.cuda.empty_cache()
+
+    evicted_count = 0
+    evicted_bytes = 0
+    device_ids = set()
+    seen = set()
+    for state in optimizer.state.values():
+        if not isinstance(state, dict):
+            continue
+        for key in ("state1", "state2"):
+            value = state.get(key)
+            if (
+                not isinstance(value, torch.Tensor)
+                or not getattr(value, "is_paged", False)
+                or id(value) in seen
+            ):
+                continue
+            seen.add(id(value))
+            prefetch_fn(value)
+            device_id = getattr(value, "page_deviceid", None)
+            if isinstance(device_id, int):
+                device_ids.add(device_id)
+            evicted_count += 1
+            evicted_bytes += value.numel() * value.element_size()
+
+    for device_id in sorted(device_ids):
+        synchronize_fn(device_id)
+        # Managed pages and inactive caching-allocator segments otherwise race
+        # to occupy all physical VRAM, starving the desktop driver on GPU 0.
+        empty_cache_fn(device_id)
+    return evicted_count, evicted_bytes
+
+
+def _install_experimental_quark_paged_optimizer_eviction(trainer: Any) -> bool:
+    """Keep managed optimizer pages from starving CUDA and the display driver."""
+    if trainer is None or not hasattr(trainer, "create_optimizer"):
+        return False
+    original_create_optimizer = trainer.create_optimizer
+
+    def _create_optimizer_with_eviction(trainer_self, *args, **kwargs):
+        result = original_create_optimizer(*args, **kwargs)
+        optimizer = getattr(trainer_self, "optimizer", None) or result
+        base_optimizer = _unwrap_paged_optimizer(optimizer)
+        if base_optimizer is None or getattr(
+            base_optimizer, "_unsloth_quark_cpu_evict_installed", False
+        ):
+            return result
+
+        original_step = base_optimizer.step
+
+        def _step_with_cpu_eviction(*step_args, **step_kwargs):
+            step_result = original_step(*step_args, **step_kwargs)
+            count, evicted_bytes = _evict_paged_optimizer_state_to_cpu(base_optimizer)
+            if count == 0:
+                raise RuntimeError(
+                    "Experimental Quark CPT could not evict any paged optimizer "
+                    "state after an update; refusing to continue without VRAM headroom."
+                )
+            if not getattr(base_optimizer, "_unsloth_quark_cpu_evict_logged", False):
+                logger.info(
+                    "Experimental Quark CPT: evicted "
+                    f"{count} optimizer state buffers ({evicted_bytes / 2**30:.6f} GiB) "
+                    "to CPU after the optimizer update.\n"
+                )
+                base_optimizer._unsloth_quark_cpu_evict_logged = True
+            return step_result
+
+        base_optimizer.step = _step_with_cpu_eviction
+        base_optimizer._unsloth_quark_cpu_evict_installed = True
+        return result
+
+    trainer.create_optimizer = types.MethodType(_create_optimizer_with_eviction, trainer)
+    return True
+
+
+def _install_experimental_quark_paged_optimizer_resume(trainer: Any) -> bool:
+    """Preserve bitsandbytes paging when Transformers restores optimizer.pt."""
+    if trainer is None or not hasattr(trainer, "_load_optimizer_and_scheduler"):
+        return False
+    original_restore = trainer._load_optimizer_and_scheduler
+
+    def _paged_restore(trainer_self, checkpoint):
+        optimizer = getattr(trainer_self, "optimizer", None)
+        base_optimizer = _unwrap_paged_optimizer(optimizer)
+        if checkpoint is None or base_optimizer is None:
+            return original_restore(checkpoint)
+
+        original_load_state_dict = base_optimizer.load_state_dict
+
+        def _load_state_dict_without_cuda_materialization(state_dict, *args, **kwargs):
+            del args, kwargs
+            result = original_load_state_dict(state_dict, move_to_device = False)
+            count, restored_bytes = _restore_paged_optimizer_state_buffers(base_optimizer)
+            if count == 0:
+                state_summary = []
+                for parameter, state in list(base_optimizer.state.items())[:8]:
+                    device = getattr(parameter, "device", None)
+                    keys = sorted(state) if isinstance(state, dict) else [type(state).__name__]
+                    state_summary.append(f"{device}:{keys}")
+                raise RuntimeError(
+                    "Experimental Quark CPT could not restore any paged optimizer "
+                    "state buffers; refusing a potentially non-paged resume. "
+                    f"Loaded states={len(base_optimizer.state)}; samples={state_summary}"
+                )
+            logger.info(
+                "Experimental Quark CPT: restored "
+                f"{count} optimizer state buffers ({restored_bytes / 2**30:.6f} GiB) "
+                "as managed CUDA pages.\n"
+            )
+            return result
+
+        base_optimizer.load_state_dict = _load_state_dict_without_cuda_materialization
+        try:
+            return original_restore(checkpoint)
+        finally:
+            base_optimizer.load_state_dict = original_load_state_dict
+
+    trainer._load_optimizer_and_scheduler = types.MethodType(_paged_restore, trainer)
+    return True
+
+
+def _build_experimental_quark_device_map() -> dict[str, int]:
+    """Place dense vocabulary endpoints on separate GPUs with desktop headroom."""
+    device_map = {
+        "model.visual": 0,
+        "model.language_model.embed_tokens": 0,
+        "model.language_model.rotary_emb": 0,
+        "model.language_model.norm": 1,
+        "lm_head": 1,
+    }
+    for layer_index in range(64):
+        device_map[f"model.language_model.layers.{layer_index}"] = (
+            0 if layer_index < EXPERIMENTAL_QUARK_FIRST_CUDA_LAYER_COUNT else 1
+        )
+    return device_map
+
+
+def _disable_experimental_quark_double_buffering() -> None:
+    """Use Zoo's single-buffer checkpoint reload for the packed Quark path."""
+    # Quark's W4A4 recompute kernels already cross two CUDA devices. Do not add
+    # Zoo's opportunistic second activation buffer and copy-stream overlap: the
+    # resulting shared-buffer lifetime is not validated with these custom
+    # kernels and is a plausible contributor to the rare, nondeterministic Xid
+    # 31 faults observed in long CPT runs. Single-buffer offload remains enabled.
+    os.environ["UNSLOTH_DISABLE_DOUBLE_BUFFER"] = "1"
+
+    # Zoo caches this setting on first gradient-checkpoint initialization. The
+    # Studio worker normally reaches this before initialization, but clearing a
+    # pre-existing cache makes the narrow safety setting deterministic.
+    gradient_checkpointing = sys.modules.get("unsloth_zoo.gradient_checkpointing")
+    disabled = getattr(gradient_checkpointing, "_double_buffer_disabled", None)
+    cache_clear = getattr(disabled, "cache_clear", None)
+    if cache_clear is not None:
+        cache_clear()
+
+
+def _is_supported_local_quark_qwen35_checkpoint(model_path: str) -> bool:
+    """Recognize only the packed Quark format validated by the CPT experiment."""
+    try:
+        config_path = Path(model_path) / "config.json"
+        if not config_path.is_file():
+            return False
+        with config_path.open("r", encoding="utf-8") as config_file:
+            raw_config = json.load(config_file)
+        from unsloth.models.quark import is_quark_qwen35_mxfp4_config
+
+        text_config = raw_config.get("text_config") or {}
+        return is_quark_qwen35_mxfp4_config(raw_config) and all(
+            (
+                text_config.get("num_hidden_layers") == 64,
+                text_config.get("hidden_size") == 5120,
+                text_config.get("vocab_size") == 248320,
+            )
+        )
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+
 
 def _build_report_targets(training_args) -> list[str] | str:
     report_to: list[str] = []
@@ -296,6 +664,7 @@ class UnslothTrainer:
         self.should_stop = False
         self.save_on_stop = True
         self.load_in_4bit = True
+        self._experimental_quark_qlora = False
 
         self.is_cpt = False  # Continued Pretraining
         self.is_vlm = False
@@ -726,6 +1095,7 @@ class UnslothTrainer:
         if self.should_stop and self.save_on_stop:
             self.trainer._save_checkpoint(self.trainer.model, trial = None)
             self.trainer.save_model()
+            self._verify_quark_adapter_save(output_dir)
             self.tokenizer.save_pretrained(output_dir)
             self._patch_adapter_config(output_dir)
             msg = f"{label} training stopped" if label else "Training stopped"
@@ -740,6 +1110,7 @@ class UnslothTrainer:
             self._update_progress(is_training = False, status_message = "Training cancelled.")
         else:
             self.trainer.save_model()
+            self._verify_quark_adapter_save(output_dir)
             self.tokenizer.save_pretrained(output_dir)
             self._patch_adapter_config(output_dir)
             msg = f"{label} training completed" if label else "Training completed"
@@ -749,6 +1120,48 @@ class UnslothTrainer:
                 is_completed = True,
                 status_message = f"Training completed! Model saved to {output_dir}",
             )
+
+    def _verify_quark_adapter_save(self, output_dir) -> None:
+        """Fail loudly if a packed-Quark run's final adapter omits trained tensors."""
+        if not self._experimental_quark_qlora:
+            return
+        from safetensors import safe_open
+
+        adapter_files = sorted(Path(output_dir).glob("adapter_model*.safetensors"))
+        if not adapter_files:
+            raise RuntimeError(
+                "Packed Quark CPT save validation found no adapter_model safetensors file."
+            )
+        keys = set()
+        for adapter_file in adapter_files:
+            with safe_open(adapter_file, framework="pt", device="cpu") as tensors:
+                keys.update(tensors.keys())
+
+        expected_wrappers = int(
+            getattr(self.model, "_unsloth_quark_lora_wrapper_count", 0)
+        )
+        lora_a = sum(".lora_A." in key for key in keys)
+        lora_b = sum(".lora_B." in key for key in keys)
+        has_embed = any("embed_tokens" in key for key in keys)
+        has_head = any("lm_head" in key for key in keys)
+        if (
+            expected_wrappers <= 0
+            or lora_a != expected_wrappers
+            or lora_b != expected_wrappers
+            or not has_embed
+            or not has_head
+        ):
+            raise RuntimeError(
+                "Packed Quark CPT adapter save is incomplete: "
+                f"files={len(adapter_files)}, keys={len(keys)}, lora_A={lora_a}, "
+                f"lora_B={lora_b}, expected_each={expected_wrappers}, "
+                f"embed_tokens={has_embed}, lm_head={has_head}."
+            )
+        logger.info(
+            "Validated packed Quark adapter save: %d keys, %d LoRA pairs, dense endpoints present.",
+            len(keys),
+            expected_wrappers,
+        )
 
     def _cleanup_audio_artifacts(self):
         """Remove sys.path/sys.modules entries from previous audio preprocessing.
@@ -994,6 +1407,69 @@ class UnslothTrainer:
                 bool(getattr(torch.version, "hip", None)) or "rocm" in torch.__version__.lower()
             )
             _auto_dtype = torch.float16 if (_is_rocm and not is_bfloat16_supported()) else None
+            self._experimental_quark_qlora = _is_supported_local_quark_qwen35_checkpoint(
+                lookup_name
+            )
+            if self._experimental_quark_qlora:
+                if full_finetuning:
+                    raise ValueError(
+                        "The experimental packed Quark path supports a frozen base plus LoRA, "
+                        "not full finetuning."
+                    )
+                if self.is_vlm:
+                    raise ValueError(
+                        "The experimental packed Quark path is validated for text CPT only; "
+                        "vision-tower training is not supported."
+                    )
+                if _is_rocm or not is_bfloat16_supported():
+                    raise ValueError(
+                        "The experimental packed Quark CPT path currently requires CUDA with BF16 support."
+                    )
+                load_in_4bit = False
+                self.load_in_4bit = False
+                _auto_dtype = torch.bfloat16
+                logger.warning(
+                    "Enabling narrow experimental Qwen3.5 Quark W4A4 MXFP4 QLoRA support: "
+                    "packed-state validation, BF16 endpoints, and Quark-safe PEFT dispatch are mandatory."
+                )
+                if get_visible_gpu_count() != 2:
+                    raise ValueError(
+                        "The validated packed Quark CPT topology currently requires exactly two visible GPUs."
+                    )
+                allocator_config = (
+                    os.environ.get("PYTORCH_ALLOC_CONF")
+                    or os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
+                    or ""
+                )
+                allocator_items = [
+                    item.strip()
+                    for item in allocator_config.split(",")
+                    if item.strip() and not item.strip().startswith("expandable_segments:")
+                ]
+                allocator_items.append("expandable_segments:True")
+                allocator_config = ",".join(allocator_items)
+                allocator_setter = getattr(
+                    torch._C,
+                    "_accelerator_setAllocatorSettings",
+                    None,
+                )
+                if allocator_setter is None:
+                    raise RuntimeError(
+                        "The packed Quark CPT path requires a Torch build that can enable "
+                        "expandable CUDA allocator segments before the model is loaded."
+                    )
+                allocator_setter(allocator_config)
+                os.environ["PYTORCH_ALLOC_CONF"] = allocator_config
+                _disable_experimental_quark_double_buffering()
+                fused_ce_target_gb = _configure_experimental_quark_fused_ce_workspace()
+                device_map = _build_experimental_quark_device_map()
+                logger.info(
+                    "Using the measured dense-endpoint Quark placement: "
+                    "layers 0-27 plus embeddings on cuda:0; layers 28-63 plus lm_head on cuda:1; "
+                    f"fused-CE target={fused_ce_target_gb:.3g} GiB; "
+                    "expandable CUDA allocator segments enabled; "
+                    "gradient-checkpoint reload double buffering disabled."
+                )
 
             if self._audio_type == "csm":
                 # CSM: FastModel, auto_model=CsmForConditionalGeneration, load_in_4bit=False
@@ -1164,7 +1640,21 @@ class UnslothTrainer:
                     token = hf_token,
                     trust_remote_code = trust_remote_code,
                     revision = model_revision,
-                    use_exact_model_name = model_revision is not None,
+                    use_exact_model_name = (
+                        model_revision is not None or self._experimental_quark_qlora
+                    ),
+                    experimental_quark_qlora = self._experimental_quark_qlora,
+                    experimental_quark_offload_frozen_vision=(
+                        self._experimental_quark_qlora
+                    ),
+                    **(
+                        {
+                            "attn_implementation": "flash_attention_2",
+                            "offload_embedding": False,
+                        }
+                        if self._experimental_quark_qlora
+                        else {}
+                    ),
                 )
                 logger.info("Loaded text model")
 
@@ -1456,6 +1946,38 @@ class UnslothTrainer:
                     modules_to_save = modules_to_save,
                 )
             else:
+                if self._experimental_quark_qlora and isinstance(target_modules, list):
+                    required_dense_endpoints = {"embed_tokens", "lm_head"}
+                    if not required_dense_endpoints.issubset(modules_to_save or []):
+                        raise ValueError(
+                            "The validated packed Quark CPT topology requires dense BF16 "
+                            "embed_tokens and lm_head in modules_to_save."
+                        )
+                    standard_targets = {
+                        "q_proj",
+                        "k_proj",
+                        "v_proj",
+                        "o_proj",
+                        "gate_proj",
+                        "up_proj",
+                        "down_proj",
+                    }
+                    if standard_targets.issubset(target_modules):
+                        hybrid_targets = (
+                            "in_proj_qkv",
+                            "in_proj_z",
+                            "in_proj_a",
+                            "in_proj_b",
+                            "out_proj",
+                        )
+                        target_modules = [
+                            *target_modules,
+                            *(name for name in hybrid_targets if name not in target_modules),
+                        ]
+                        logger.info(
+                            "Expanded the standard Qwen target set to all 12 language projection "
+                            f"types for packed Quark CPT: {target_modules}\n"
+                        )
                 logger.info(f"Text model LoRA configuration:")
                 logger.info(f"  - Target modules: {target_modules}\n")
                 if modules_to_save:
@@ -1474,6 +1996,17 @@ class UnslothTrainer:
                     use_dora = use_dora,
                     loftq_config = {"loftq_bits": 4, "loftq_iter": 1} if use_loftq else None,
                     modules_to_save = modules_to_save,
+                    experimental_quark_activation_chunk_size=(
+                        EXPERIMENTAL_QUARK_ACTIVATION_CHUNK_SIZE
+                        if self._experimental_quark_qlora
+                        else None
+                    ),
+                    experimental_quark_release_cache_after_forward=(
+                        self._experimental_quark_qlora
+                    ),
+                    experimental_quark_offload_redundant_dense_originals=(
+                        self._experimental_quark_qlora
+                    ),
                 )
 
             if self.should_stop:
@@ -4077,7 +4610,18 @@ class UnslothTrainer:
                 logger.info("No eval dataset — evaluation disabled\n")
 
             # Use training_args optim/lr_scheduler_type if given, else defaults
-            optim_value = training_args.get("optim", "adamw_8bit")
+            requested_optim_value = training_args.get("optim", "adamw_8bit")
+            optim_value = _resolve_experimental_quark_optimizer(
+                requested_optim_value,
+                self._experimental_quark_qlora,
+            )
+            if optim_value != requested_optim_value:
+                logger.warning(
+                    "Experimental Quark dense-vocabulary CPT: replacing "
+                    f"optimizer {requested_optim_value!r} with {optim_value!r}. "
+                    "Both use bitsandbytes 8-bit AdamW updates; paging is required "
+                    "to keep optimizer state from exhausting CUDA memory.\n"
+                )
             lr_scheduler_type_value = training_args.get("lr_scheduler_type", "linear")
 
             if (self.is_vlm or self.is_audio_vlm) and not raw_text_mode:
@@ -4252,6 +4796,17 @@ class UnslothTrainer:
                 # Restore the full processor so checkpoints include preprocessor_config.json (GGUF export).
                 if sft_tokenizer is not self.tokenizer:
                     self.trainer.processing_class = self.tokenizer
+            if (
+                self._experimental_quark_qlora
+                and _install_experimental_quark_loss_only_evaluation(self.trainer)
+            ):
+                logger.warning(
+                    "Experimental Quark CPT: periodic evaluation is loss-only so "
+                    "near-8K rows do not materialize full FP32 vocabulary logits.\n"
+                )
+            if self._experimental_quark_qlora:
+                _install_experimental_quark_paged_optimizer_eviction(self.trainer)
+                _install_experimental_quark_paged_optimizer_resume(self.trainer)
             logger.info("Trainer initialized\n")
 
             # ========== TRAIN ON RESPONSES ONLY ==========

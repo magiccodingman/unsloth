@@ -1009,6 +1009,40 @@ class TestGetTransformersTier:
 
         assert get_transformers_tier(str(tmp_path)) == "550"
 
+    def test_supported_packed_quark_qwen35_uses_fixed_550_deserializer(
+        self,
+        tmp_path: Path,
+    ):
+        tensor = {"dtype": "fp4", "group_size": 32, "scale_format": "e8m0"}
+        cfg = {
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "model_type": "qwen3_5",
+            "text_config": {
+                "model_type": "qwen3_5_text",
+                "num_hidden_layers": 64,
+                "hidden_size": 5120,
+                "vocab_size": 248320,
+            },
+            "quantization_config": {
+                "quant_method": "quark",
+                "quant_mode": "eager_mode",
+                "global_quant_config": {
+                    "weight": {**tensor, "is_dynamic": False},
+                    "input_tensors": {**tensor, "is_dynamic": True},
+                },
+                "export": {"weight_format": "real_quantized"},
+            },
+        }
+        (tmp_path / "config.json").write_text(json.dumps(cfg))
+
+        assert get_transformers_tier(str(tmp_path)) == "550"
+
+        cfg["quantization_config"]["global_quant_config"]["weight"]["group_size"] = 64
+        (tmp_path / "config.json").write_text(json.dumps(cfg))
+        _config_json_cache.clear()
+        _config_needs_550_cache.clear()
+        assert get_transformers_tier(str(tmp_path)) == "530"
+
     def test_gemma4_unified_config_json_returns_510(self, tmp_path: Path):
         """Local checkpoint with Gemma4 Unified architecture → 510."""
         cfg = {
